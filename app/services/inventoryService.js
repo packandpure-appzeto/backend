@@ -7,19 +7,22 @@ import Product from "../models/product.js";
  */
 
 export const getHubStock = async (productId, hubLocation) => {
-  return await HubInventory.findOne({ productId, hubLocation });
+  const hubId = hubLocation || process.env.DEFAULT_HUB_ID || "MAIN_HUB";
+  return await HubInventory.findOne({ productId, hubId });
 };
 
 export const updateHubStock = async (productId, hubLocation, delta) => {
+  const hubId = hubLocation || process.env.DEFAULT_HUB_ID || "MAIN_HUB";
   return await HubInventory.findOneAndUpdate(
-    { productId, hubLocation },
+    { productId, hubId },
     { $inc: { availableQty: delta }, $set: { lastUpdated: new Date() } },
     { new: true, upsert: true }
   );
 };
 
 export const reserveStock = async (productId, hubLocation, quantity) => {
-  const inventory = await HubInventory.findOne({ productId, hubLocation });
+  const hubId = hubLocation || process.env.DEFAULT_HUB_ID || "MAIN_HUB";
+  const inventory = await HubInventory.findOne({ productId, hubId });
   if (!inventory || inventory.availableQty < quantity) {
     return { success: false, available: inventory?.availableQty || 0 };
   }
@@ -31,8 +34,9 @@ export const reserveStock = async (productId, hubLocation, quantity) => {
 };
 
 export const releaseStock = async (productId, hubLocation, quantity) => {
+  const hubId = hubLocation || process.env.DEFAULT_HUB_ID || "MAIN_HUB";
   return await HubInventory.findOneAndUpdate(
-    { productId, hubLocation },
+    { productId, hubId },
     { $inc: { availableQty: quantity, reservedQty: -quantity } },
     { new: true }
   );
