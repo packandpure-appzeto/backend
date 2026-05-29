@@ -237,3 +237,26 @@ export const sellerGeocodeAddress = async (req, res) => {
     return handleResponse(res, 400, error.message);
   }
 };
+
+/* ===============================
+   UPDATE SELLER PASSWORD
+================================ */
+export const updateSellerPassword = async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    const seller = await Seller.findById(req.user.id).select("+password");
+    if (!seller) {
+      return handleResponse(res, 404, "Seller not found");
+    }
+    const isMatch = await seller.comparePassword(currentPassword);
+    if (!isMatch) {
+      return handleResponse(res, 401, "Invalid current password");
+    }
+    seller.password = newPassword;
+    await seller.save();
+    return handleResponse(res, 200, "Password updated successfully");
+  } catch (error) {
+    return handleResponse(res, 500, error.message);
+  }
+};
+

@@ -29,6 +29,16 @@ const adminSchema = new mongoose.Schema(
       select: false,
     },
 
+    otp: {
+      type: String,
+      select: false,
+    },
+
+    otpExpiry: {
+      type: Date,
+      select: false,
+    },
+
     role: {
       type: String,
       default: "admin",

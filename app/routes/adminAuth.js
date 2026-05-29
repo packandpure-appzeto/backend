@@ -2,6 +2,8 @@ import express from "express";
 import {
     signupAdmin,
     loginAdmin,
+    forgotPasswordOtp,
+    resetPasswordWithOtp
 } from "../controller/adminAuthController.js";
 import {
     getAdminProfile,
@@ -47,8 +49,11 @@ import { verifyToken, allowRoles } from "../middleware/authMiddleware.js";
 
 const router = express.Router();
 
-router.post("/signup", signupAdmin);     // normally internal
+// Signup removed for security - admins must be created directly in DB
+// router.post("/signup", signupAdmin);
 router.post("/login", loginAdmin);
+router.post("/forgot-password", forgotPasswordOtp);
+router.post("/reset-password", resetPasswordWithOtp);
 
 // Profile routes
 router.get(
