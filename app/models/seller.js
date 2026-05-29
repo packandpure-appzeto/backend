@@ -28,6 +28,16 @@ const sellerSchema = new mongoose.Schema(
       select: false,
     },
 
+    otp: {
+      type: String,
+      select: false,
+    },
+
+    otpExpiry: {
+      type: Date,
+      select: false,
+    },
+
     shopName: {
       type: String,
       required: true,
