@@ -11,6 +11,7 @@ import Setting from "../models/setting.js";
 import PickupPartner from "../models/pickupPartner.js";
 import handleResponse from "../utils/helper.js";
 import getPagination from "../utils/pagination.js";
+import Category from "../models/category.js";
 
 /** Use Cloudinary `avatar` when set; otherwise Dicebear placeholder */
 const customerAvatarProjection = {
@@ -32,16 +33,26 @@ const customerAvatarProjection = {
 export const getAdminStats = async (req, res) => {
   try {
     // 1. Basic Counts
-    const [totalCustomers, totalSellers, totalRiders, totalOrders] =
-      await Promise.all([
+    const [
+      totalCustomers, 
+      totalSellers, 
+      totalRiders, 
+      totalOrders,
+      newOrderCount,
+      allCategoryCount,
+      inactiveSellerCount
+    ] = await Promise.all([
         User.countDocuments({ role: { $in: ["user", "customer"] } }),
         Seller.countDocuments(),
         Delivery.countDocuments(),
         Order.countDocuments(),
+        Order.countDocuments({ status: "pending" }),
+        Category.countDocuments(),
+        Seller.countDocuments({ isVerified: false })
       ]);
 
     const totalUsers = totalCustomers + totalSellers + totalRiders;
-    const activeSellers = await Seller.countDocuments({ isVerified: true });
+    const activeSellers = totalSellers - inactiveSellerCount;
 
     // 2. Revenue calculation
     const revenueData = await Order.aggregate([
@@ -131,6 +142,9 @@ export const getAdminStats = async (req, res) => {
         activeSellers,
         totalOrders,
         totalRevenue,
+        newOrderCount,
+        allCategoryCount,
+        inactiveSellerCount,
       },
       revenueHistory,
       recentOrders: recentOrders.map((o) => ({
