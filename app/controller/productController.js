@@ -1,6 +1,9 @@
 import mongoose from "mongoose";
 import Product from "../models/product.js";
 import HubInventory from "../models/hubInventory.js";
+import Admin from "../models/admin.js";
+import Notification from "../models/notification.js";
+import Seller from "../models/seller.js";
 import { handleResponse } from "../utils/helper.js";
 import { uploadToCloudinary } from "../utils/cloudinary.js";
 import getPagination from "../utils/pagination.js";
@@ -597,6 +600,29 @@ export const createProduct = async (req, res) => {
         throw saveErr;
       }
     }
+
+    // --- NOTIFY ADMINS IF SELLER CREATED PRODUCT ---
+    if (product.ownerType === "seller") {
+        try {
+            const seller = await Seller.findById(product.sellerId).select('shopName name');
+            const vendorName = seller ? (seller.shopName || seller.name) : 'Unknown Vendor';
+            const admins = await Admin.find({}, '_id');
+            const notifications = admins.map(admin => ({
+                recipient: admin._id,
+                recipientModel: 'Admin',
+                title: 'New Product Added',
+                message: `New Product Added: ${product.name} by Vendor: ${vendorName}.`,
+                type: 'system',
+                data: { productId: product._id, sellerId: product.sellerId }
+            }));
+            if (notifications.length > 0) {
+                await Notification.insertMany(notifications);
+            }
+        } catch (notifErr) {
+            console.error("Error creating admin notification for new product:", notifErr);
+        }
+    }
+    // -----------------------------------------------
 
     // Ensure Admin products have an entry in Hub Inventory
     if (product.ownerType === "admin") {

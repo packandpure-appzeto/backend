@@ -11,7 +11,6 @@ import { initSocket, getIO } from "./app/socket/socketManager.js"
 import { registerOrderSocketGetter } from "./app/services/orderSocketEmitter.js"
 
 dotenv.config();
-
 const app = express();
 const server = http.createServer(app);
 const PORT = process.env.PORT || 7000;
@@ -126,7 +125,7 @@ app.use((err, req, res, next) => {
 const startServer = async () => {
   try {
     await connectDB();
-    
+
     // Start background jobs after DB is connected
     startOrderAutoCancelJob();
     startSlaMonitorJob();

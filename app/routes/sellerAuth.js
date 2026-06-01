@@ -1,9 +1,10 @@
 import express from "express";
-import { signupSeller, loginSeller } from "../controller/sellerAuthController.js";
+import { signupSeller, loginSeller, forgotPasswordOtp, resetPasswordWithOtp } from "../controller/sellerAuthController.js";
 import upload from "../middleware/uploadMiddleware.js";
 import {
     getSellerProfile,
     updateSellerProfile,
+    updateSellerPassword,
     requestWithdrawal,
     getNearbySellers,
     sellerReverseGeocode,
@@ -30,6 +31,8 @@ router.post(
     signupSeller
 );
 router.post("/login", loginSeller);
+router.post("/forgot-password", forgotPasswordOtp);
+router.post("/reset-password", resetPasswordWithOtp);
 router.get("/nearby", getNearbySellers);
 
 // Profile routes
@@ -45,6 +48,13 @@ router.put(
     verifyToken,
     allowRoles("seller"),
     updateSellerProfile
+);
+
+router.put(
+    "/profile/password",
+    verifyToken,
+    allowRoles("seller"),
+    updateSellerPassword
 );
 
 router.get(
