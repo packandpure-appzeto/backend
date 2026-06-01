@@ -3,6 +3,7 @@ import Transaction from "../models/transaction.js";
 import HubInventory from "../models/hubInventory.js";
 import Seller from "../models/seller.js";
 import handleResponse from "../utils/helper.js";
+import { resolveOrderItemVariantLabel } from "../utils/orderItemHelpers.js";
 
 /**
  * Utility to convert array of objects to CSV string
@@ -43,17 +44,19 @@ export const exportGstReport = async (req, res) => {
 
     const orders = await Order.find(query)
       .select("orderId createdAt items pricing")
-      .populate("items.product", "name")
+      .populate("items.product", "name variants unit")
       .lean();
 
     const reportData = [];
     orders.forEach(order => {
       order.items.forEach(item => {
         if (item.gstAmount > 0 || item.gstRate > 0) {
+          const variantLabel = resolveOrderItemVariantLabel(item);
           reportData.push({
             OrderId: order.orderId,
             Date: order.createdAt.toISOString().split("T")[0],
             Product: item.name || (item.product?.name) || "Unknown",
+            Variant: variantLabel || "",
             Quantity: item.quantity,
             UnitPrice: item.price,
             TaxableAmount: ((item.price * item.quantity) - (item.gstAmount || 0)).toFixed(2),
@@ -66,7 +69,7 @@ export const exportGstReport = async (req, res) => {
     });
 
     const csv = jsonToCsv(reportData, [
-      "OrderId", "Date", "Product", "Quantity", "UnitPrice", "TaxableAmount", "GstRate", "GstAmount", "Total"
+      "OrderId", "Date", "Product", "Variant", "Quantity", "UnitPrice", "TaxableAmount", "GstRate", "GstAmount", "Total"
     ]);
 
     res.setHeader("Content-Type", "text/csv");

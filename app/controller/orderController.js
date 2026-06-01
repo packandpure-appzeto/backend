@@ -37,8 +37,59 @@ import {
   orderMatchQueryFromRouteParam,
   orderMatchQueryFlexible,
 } from "../utils/orderLookup.js";
+import {
+  ORDER_ITEM_PRODUCT_POPULATE,
+  enrichOrderDoc,
+  findOrderVariant,
+  formatOrderVariantSlot,
+  resolveOrderItemPrice,
+} from "../utils/orderItemHelpers.js";
+import { resolveVariantIndex } from "../utils/productHelpers.js";
 
 // COD strike logic now handled in orderService.js
+
+const ORDER_CART_POPULATE =
+  "name slug price salePrice purchasePrice mainImage stock gstRate unit variants";
+
+async function reverseOrderItemStock(item, order) {
+  const qty = Number(item.quantity) || 0;
+  if (qty <= 0) return;
+
+  const productId = item.product?._id || item.product;
+  if (!productId) return;
+
+  if (item.variantId) {
+    const product = await Product.findById(productId)
+      .select("variants sellerId")
+      .lean();
+    const idx = resolveVariantIndex(product, { variantId: item.variantId });
+    if (idx >= 0) {
+      await Product.updateOne(
+        { _id: productId },
+        {
+          $inc: {
+            [`variants.${idx}.stock`]: qty,
+            stock: qty,
+          },
+        },
+      );
+    } else {
+      await Product.findByIdAndUpdate(productId, { $inc: { stock: qty } });
+    }
+  } else {
+    await Product.findByIdAndUpdate(productId, { $inc: { stock: qty } });
+  }
+
+  await StockHistory.create({
+    product: productId,
+    seller: order.seller,
+    type: "Correction",
+    quantity: qty,
+    note: `Order #${order.orderId} Cancelled`,
+    order: order._id,
+    variantId: item.variantId || undefined,
+  });
+}
 
 /* ===============================
    PLACE ORDER
@@ -90,18 +141,27 @@ export const placeOrder = async (req, res) => {
     if (!orderItems || orderItems.length === 0) {
       const cart = await Cart.findOne({ customerId }).populate(
         "items.productId",
+        ORDER_CART_POPULATE,
       );
       if (!cart || cart.items.length === 0) {
         return handleResponse(res, 400, "Cannot place order with empty cart");
       }
-      orderItems = cart.items.map((item) => ({
-        product: item.productId._id,
-        name: item.productId.name,
-        quantity: item.quantity,
-        price: item.productId.salePrice || item.productId.price,
-        purchasePrice: item.productId.purchasePrice || 0,
-        image: item.productId.mainImage,
-      }));
+      orderItems = cart.items.map((item) => {
+        const product = item.productId;
+        const variant = item.variantId
+          ? findOrderVariant(product, item.variantId)
+          : null;
+        return {
+          product: product._id,
+          name: product.name,
+          quantity: item.quantity,
+          price: resolveOrderItemPrice(product, variant),
+          purchasePrice: product.purchasePrice || 0,
+          image: product.mainImage,
+          variantId: item.variantId || undefined,
+          variantSlot: formatOrderVariantSlot(variant, product),
+        };
+      });
     }
 
     // 3. Normalize address.location so only valid numeric coords are stored
@@ -168,19 +228,29 @@ export const placeOrder = async (req, res) => {
 
         // Always fetch the latest product data to ensure pricing/purchasePrice integrity
         const productData = await Product.findById(resolvedProductId)
-          .select("_id purchasePrice salePrice price gstRate")
+          .select("_id purchasePrice salePrice price gstRate variants unit mainImage name")
           .lean();
 
         if (!productData) {
           return handleResponse(res, 400, `Product not found: ${item?.name || resolvedProductId}`);
         }
 
+        const variantId = item.variantId || null;
+        const variant = variantId
+          ? findOrderVariant(productData, variantId)
+          : null;
+
         normalizedItems.push({
           ...item,
           product: String(productData._id),
+          name: item.name || productData.name,
           purchasePrice: productData.purchasePrice || 0,
-          price: item.price || productData.salePrice || productData.price,
+          price: resolveOrderItemPrice(productData, variant, item.price),
           gstRate: productData.gstRate || 0,
+          image: item.image || productData.mainImage,
+          variantId: variantId || undefined,
+          variantSlot:
+            item.variantSlot || formatOrderVariantSlot(variant, productData),
         });
       }
       orderItems = normalizedItems;
@@ -465,10 +535,15 @@ export const getMyOrders = async (req, res) => {
         "orderId customer seller items address payment pricing status workflowStatus workflowVersion returnStatus timeSlot createdAt",
       )
       .sort({ createdAt: -1 })
-      .populate("items.product", "name mainImage price salePrice")
+      .populate("items.product", ORDER_ITEM_PRODUCT_POPULATE)
       .lean();
 
-    return handleResponse(res, 200, "Orders fetched successfully", orders);
+    return handleResponse(
+      res,
+      200,
+      "Orders fetched successfully",
+      orders.map((o) => enrichOrderDoc(o)),
+    );
   } catch (error) {
     return handleResponse(res, 500, error.message);
   }
@@ -558,7 +633,7 @@ export const getOrderDetails = async (req, res) => {
 
     const order = await Order.findOne(orderKey)
       .populate("customer", "name email phone")
-      .populate("items.product", "name mainImage price salePrice")
+      .populate("items.product", ORDER_ITEM_PRODUCT_POPULATE)
       .populate("deliveryBoy", "name phone")
       .populate("returnDeliveryBoy", "name phone")
       .populate("seller", "shopName name address phone location")
@@ -658,7 +733,7 @@ export const getOrderDetails = async (req, res) => {
       }
     }
 
-    return handleResponse(res, 200, "Order details fetched", order);
+    return handleResponse(res, 200, "Order details fetched", enrichOrderDoc(order));
   } catch (error) {
     console.error(`[ORDER_ERROR] Error fetching order details:`, error);
     return handleResponse(res, 500, error.message);
@@ -810,6 +885,7 @@ export const requestReturn = async (req, res) => {
         quantity: qty,
         price: original.price,
         variantSlot: original.variantSlot,
+        variantId: original.variantId || undefined,
         itemIndex,
         status: "requested",
       });
@@ -1102,20 +1178,8 @@ export const updateOrderStatus = async (req, res) => {
 
     // Handle Cancellation (Stock Reversal & Transaction Update)
     if (status === "cancelled" && oldStatus !== "cancelled") {
-      // 1. Reverse Stock
       for (const item of order.items) {
-        await Product.findByIdAndUpdate(item.product, {
-          $inc: { stock: item.quantity },
-        });
-
-        await StockHistory.create({
-          product: item.product,
-          seller: order.seller,
-          type: "Correction",
-          quantity: item.quantity,
-          note: `Order #${canonicalOrderId} Cancelled`,
-          order: order._id,
-        });
+        await reverseOrderItemStock(item, order);
       }
 
       // 2. Update Transaction
@@ -1623,7 +1687,7 @@ export const getSellerOrders = async (req, res) => {
       .skip(skip)
       .limit(limit)
       .populate("customer", "name phone")
-      .populate("items.product", "name mainImage price salePrice")
+      .populate("items.product", ORDER_ITEM_PRODUCT_POPULATE)
       .populate("deliveryBoy", "name phone")
       .populate("seller", "shopName name")
       .lean();
@@ -1632,10 +1696,9 @@ export const getSellerOrders = async (req, res) => {
 
     // Enrich orders with action required info for sellers to guide the frontend modal/alerts
     const enrichedItems = await Promise.all(orders.map(async (o) => {
-      // If admin, no special action flags needed for this context
-      if (role !== "seller") return o;
+      const item = enrichOrderDoc(o);
+      if (role !== "seller") return item;
 
-      const item = { ...o };
       if (o.hubFlowEnabled) {
           // Check if there's a pending purchase request for this seller
           const PurchaseRequest = mongoose.model("PurchaseRequest");

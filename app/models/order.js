@@ -40,7 +40,11 @@ const orderSchema = new mongoose.Schema(
           type: Number,
           default: 0,
         },
-        variantSlot: String, // To identify which variant was bought
+        variantSlot: String, // Human-readable variant label (e.g. "1 kg")
+        variantId: {
+          type: mongoose.Schema.Types.ObjectId,
+          required: false,
+        },
         image: String,
         gstRate: { type: Number, default: 0 },
         gstAmount: { type: Number, default: 0 },
@@ -268,6 +272,10 @@ const orderSchema = new mongoose.Schema(
           required: true,
         },
         variantSlot: String,
+        variantId: {
+          type: mongoose.Schema.Types.ObjectId,
+          required: false,
+        },
         itemIndex: {
           type: Number,
         },

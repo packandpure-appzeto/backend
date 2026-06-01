@@ -72,7 +72,11 @@ export const addToCart = async (req, res) => {
     }
 
     const variant = variantId ? findVariant(product, variantId) : null;
-    if (variantId && !variant) {
+    if (Array.isArray(product.variants) && product.variants.length > 0) {
+      if (!variantId || !variant) {
+        return handleResponse(res, 400, "Please select a product variant");
+      }
+    } else if (variantId && !variant) {
       return handleResponse(res, 400, "Variant not found");
     }
 

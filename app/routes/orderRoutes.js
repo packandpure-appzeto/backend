@@ -36,7 +36,12 @@ const customerOnly = [verifyToken, allowRoles("customer")];
 router.post("/place", ...customerOnly, placeOrder);
 router.post("/create", ...customerOnly, placeOrder);
 router.get("/my-orders", ...customerOnly, getMyOrders);
-router.get("/details/:orderId", ...customerOnly, getOrderDetails);
+router.get(
+  "/details/:orderId",
+  verifyToken,
+  allowRoles("customer", "user", "admin", "seller", "delivery"),
+  getOrderDetails,
+);
 router.put("/cancel/:orderId", ...customerOnly, cancelOrder);
 router.post("/:orderId/returns", ...customerOnly, requestReturn);
 router.get("/:orderId/returns", ...customerOnly, getReturnDetails);

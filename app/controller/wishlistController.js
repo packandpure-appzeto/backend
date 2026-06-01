@@ -1,5 +1,30 @@
 import Wishlist from "../models/wishlist.js";
 import handleResponse from "../utils/helper.js";
+import { enrichCustomerProduct } from "../utils/productHelpers.js";
+
+const WISHLIST_PRODUCT_POPULATE = {
+  path: "products",
+  select:
+    "name slug description price salePrice purchasePrice stock brand weight unit mainImage galleryImages status variants categoryId subcategoryId ownerType",
+  populate: [
+    { path: "categoryId", select: "name" },
+    { path: "subcategoryId", select: "name" },
+  ],
+};
+
+function mapWishlistProducts(products = []) {
+  return (products || []).map((p) =>
+    typeof p === "object" && p !== null && p._id
+      ? enrichCustomerProduct(
+          typeof p.toObject === "function" ? p.toObject() : { ...p },
+        )
+      : p,
+  );
+}
+
+async function populateWishlist(query) {
+  return query.populate(WISHLIST_PRODUCT_POPULATE).lean();
+}
 
 /* ===============================
    GET CUSTOMER WISHLIST
@@ -22,9 +47,7 @@ export const getWishlist = async (req, res) => {
       );
     }
 
-    const wishlist = await query
-      .populate("products", "name slug price salePrice mainImage stock status")
-      .lean();
+    const wishlist = await populateWishlist(query);
 
     if (!wishlist) {
       const newWishlist = await Wishlist.create({ customerId, products: [] });
@@ -32,11 +55,14 @@ export const getWishlist = async (req, res) => {
         res,
         200,
         "Wishlist fetched successfully",
-        newWishlist,
+        { ...newWishlist.toObject(), products: [] },
       );
     }
 
-    return handleResponse(res, 200, "Wishlist fetched successfully", wishlist);
+    return handleResponse(res, 200, "Wishlist fetched successfully", {
+      ...wishlist,
+      products: mapWishlistProducts(wishlist.products),
+    });
   } catch (error) {
     return handleResponse(res, 500, error.message);
   }
@@ -61,15 +87,18 @@ export const addToWishlist = async (req, res) => {
     }
 
     await wishlist.save();
-    const updatedWishlist = await Wishlist.findById(wishlist._id)
-      .populate("products", "name slug price salePrice mainImage stock status")
-      .lean();
+    const updatedWishlist = await populateWishlist(
+      Wishlist.findById(wishlist._id),
+    );
 
     return handleResponse(
       res,
       200,
       "Product added to wishlist",
-      updatedWishlist,
+      {
+        ...updatedWishlist,
+        products: mapWishlistProducts(updatedWishlist?.products),
+      },
     );
   } catch (error) {
     return handleResponse(res, 500, error.message);
@@ -95,15 +124,18 @@ export const removeFromWishlist = async (req, res) => {
     );
 
     await wishlist.save();
-    const updatedWishlist = await Wishlist.findById(wishlist._id)
-      .populate("products", "name slug price salePrice mainImage stock status")
-      .lean();
+    const updatedWishlist = await populateWishlist(
+      Wishlist.findById(wishlist._id),
+    );
 
     return handleResponse(
       res,
       200,
       "Product removed from wishlist",
-      updatedWishlist,
+      {
+        ...updatedWishlist,
+        products: mapWishlistProducts(updatedWishlist?.products),
+      },
     );
   } catch (error) {
     return handleResponse(res, 500, error.message);
@@ -136,11 +168,14 @@ export const toggleWishlist = async (req, res) => {
     }
 
     await wishlist.save();
-    const updatedWishlist = await Wishlist.findById(wishlist._id)
-      .populate("products", "name slug price salePrice mainImage stock status")
-      .lean();
+    const updatedWishlist = await populateWishlist(
+      Wishlist.findById(wishlist._id),
+    );
 
-    return handleResponse(res, 200, message, updatedWishlist);
+    return handleResponse(res, 200, message, {
+      ...updatedWishlist,
+      products: mapWishlistProducts(updatedWishlist?.products),
+    });
   } catch (error) {
     return handleResponse(res, 500, error.message);
   }

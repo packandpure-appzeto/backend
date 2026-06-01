@@ -334,11 +334,12 @@ export const getProducts = async (req, res) => {
         const hubRow = hubRowsForResult.find((r) => String(r.productId) === pIdStr);
         const dynamicPrice =
           hubRow?.sellPrice && hubRow.sellPrice > 0 ? hubRow.sellPrice : p.salePrice || p.price;
+        const hasVariants = Array.isArray(p.variants) && p.variants.length > 0;
 
         return {
           ...p,
-          price: dynamicPrice,
-          salePrice: dynamicPrice,
+          price: hasVariants ? p.price : dynamicPrice,
+          salePrice: hasVariants ? p.salePrice || p.price : dynamicPrice,
           purchasePrice: mappedSellerData.cost,
           stock: hubQty,
           catalogStock: hubQty,
@@ -346,10 +347,7 @@ export const getProducts = async (req, res) => {
           availableQtySeller: mappedSellerStock,
           totalAvailableQty: fulfillableQty,
           totalFulfillmentQty: fulfillableQty,
-          variants: mapVariantsForResponse(
-            p.variants,
-            isAdminCatalogRequest ? null : dynamicPrice,
-          ),
+          variants: mapVariantsForResponse(p.variants),
           fulfillmentSource:
             hubQty > 0 ? "hub" : mappedSellerStock > 0 ? "procure" : "out_of_stock",
         };
@@ -376,10 +374,7 @@ export const getProducts = async (req, res) => {
         catalogStock: sellerListingStock,
         sellerListingStock,
         totalAvailableQty: sellerListingStock,
-        variants: mapVariantsForResponse(
-          p.variants,
-          isAdminCatalogRequest ? null : customerPrice || null,
-        ),
+        variants: mapVariantsForResponse(p.variants),
         fulfillmentSource: sellerListingStock > 0 ? "direct" : "out_of_stock",
       };
     });
@@ -1220,24 +1215,143 @@ export const deleteProduct = async (req, res) => {
   }
 };
 
+/** Map one catalog row the same way as GET /products list (customer detail sheet). */
+async function mapSingleProductForCustomerCatalog(productLean) {
+  const p = productLean;
+  const pIdStr = String(p._id);
+
+  if (p.ownerType === "admin") {
+    const hubRow = await HubInventory.findOne({
+      hubId: DEFAULT_HUB_ID,
+      productId: p._id,
+    }).lean();
+    const hubQty = hubQtyFromInventoryRow(hubRow);
+
+    let mappedSellerStock = 0;
+    let mappedSellerCost = Number(p.purchasePrice) || 0;
+    try {
+      const sellerAgg = await Product.aggregate([
+        {
+          $match: {
+            masterProductId: new mongoose.Types.ObjectId(pIdStr),
+            ownerType: "seller",
+            status: "active",
+          },
+        },
+        {
+          $group: {
+            _id: "$masterProductId",
+            totalSellerStock: {
+              $sum: {
+                $cond: {
+                  if: {
+                    $and: [
+                      { $isArray: "$variants" },
+                      { $gt: [{ $size: "$variants" }, 0] },
+                    ],
+                  },
+                  then: {
+                    $reduce: {
+                      input: "$variants",
+                      initialValue: 0,
+                      in: { $add: ["$$value", { $ifNull: ["$$this.stock", 0] }] },
+                    },
+                  },
+                  else: { $ifNull: ["$stock", 0] },
+                },
+              },
+            },
+            minPurchasePrice: { $min: "$purchasePrice" },
+            avgPurchasePrice: { $avg: "$purchasePrice" },
+          },
+        },
+      ]);
+      if (sellerAgg[0]) {
+        mappedSellerStock = Number(sellerAgg[0].totalSellerStock || 0);
+        mappedSellerCost =
+          Number(sellerAgg[0].minPurchasePrice || sellerAgg[0].avgPurchasePrice) ||
+          mappedSellerCost;
+      }
+    } catch (err) {
+      console.warn("[getProductById] seller stock aggregation:", err.message);
+    }
+
+    const fulfillableQty = hubQty + mappedSellerStock;
+    const dynamicPrice =
+      hubRow?.sellPrice && hubRow.sellPrice > 0
+        ? hubRow.sellPrice
+        : p.salePrice || p.price;
+    const hasVariants = Array.isArray(p.variants) && p.variants.length > 0;
+
+    return {
+      ...p,
+      price: hasVariants ? p.price : dynamicPrice,
+      salePrice: hasVariants ? p.salePrice || p.price : dynamicPrice,
+      purchasePrice: mappedSellerCost,
+      stock: hubQty,
+      catalogStock: hubQty,
+      availableQtyHub: hubQty,
+      availableQtySeller: mappedSellerStock,
+      totalAvailableQty: fulfillableQty,
+      totalFulfillmentQty: fulfillableQty,
+      variants: mapVariantsForResponse(p.variants),
+      fulfillmentSource:
+        hubQty > 0 ? "hub" : mappedSellerStock > 0 ? "procure" : "out_of_stock",
+    };
+  }
+
+  const masterId = p.masterProductId?._id || p.masterProductId;
+  let masterProduct = null;
+  if (masterId) {
+    masterProduct = await Product.findById(masterId).select("price salePrice").lean();
+  }
+  const customerPrice = masterProduct
+    ? masterProduct.salePrice || masterProduct.price
+    : p.salePrice || p.price;
+  const sellerListingStock = catalogStockFromProduct(p);
+  let hubQtyForSeller = 0;
+  if (masterId) {
+    const hubRow = await HubInventory.findOne({
+      hubId: DEFAULT_HUB_ID,
+      productId: masterId,
+    }).lean();
+    hubQtyForSeller = hubQtyFromInventoryRow(hubRow);
+  }
+
+  return {
+    ...p,
+    price: customerPrice || p.price,
+    salePrice: customerPrice || p.salePrice,
+    availableQtyHub: hubQtyForSeller,
+    availableQtySeller: sellerListingStock,
+    stock: sellerListingStock,
+    catalogStock: sellerListingStock,
+    sellerListingStock,
+    totalAvailableQty: sellerListingStock,
+    variants: mapVariantsForResponse(p.variants),
+    fulfillmentSource: sellerListingStock > 0 ? "direct" : "out_of_stock",
+  };
+}
+
 /* ===============================
    GET SINGLE PRODUCT
  ================================ */
 export const getProductById = async (req, res) => {
   try {
     const { id } = req.params;
-    const enforceRadius = isCustomerVisibilityRequest(req);
+    const enforceCustomerCatalog = isCustomerVisibilityRequest(req);
+    const coords = parseCustomerCoordinates(req.query || {});
+
+    if (enforceCustomerCatalog && !coords.valid) {
+      return handleResponse(
+        res,
+        400,
+        "lat and lng are required for customer product visibility",
+      );
+    }
 
     let nearbySellerSet = null;
-    const coords = parseCustomerCoordinates(req.query || {});
-    if (enforceRadius) {
-      if (!coords.valid) {
-        return handleResponse(
-          res,
-          400,
-          "lat and lng are required for customer product visibility",
-        );
-      }
+    if (enforceCustomerCatalog && coords.valid) {
       const nearbySellerIds = await getNearbySellerIdsForCustomer(
         coords.lat,
         coords.lng,
@@ -1249,29 +1363,64 @@ export const getProductById = async (req, res) => {
       .populate("categoryId", "name")
       .populate("subcategoryId", "name")
       .populate("sellerId", "shopName")
-      .populate("masterProductId", "description brand weight unit variants galleryImages mainImage");
+      .populate(
+        "masterProductId",
+        "description brand weight unit variants galleryImages mainImage",
+      );
 
     if (!product) {
       return handleResponse(res, 404, "Product not found");
     }
 
-    if (enforceRadius) {
-      if (String(product.status || "") !== "active") {
+    const productLean =
+      typeof product.toObject === "function" ? product.toObject() : product;
+
+    if (enforceCustomerCatalog) {
+      if (String(productLean.status || "") !== "active") {
         return handleResponse(res, 404, "Product not available");
       }
-      const sellerIdForProduct = String(product.sellerId?._id || product.sellerId);
-      if (!nearbySellerSet || !nearbySellerSet.has(sellerIdForProduct)) {
-        return handleResponse(res, 404, "Product not available in your area");
+
+      if (productLean.ownerType === "admin") {
+        const hubRow = await HubInventory.findOne({
+          hubId: DEFAULT_HUB_ID,
+          productId: productLean._id,
+          availableQty: { $gt: 0 },
+        }).lean();
+        const hasHubStock = Boolean(hubRow);
+        let hasSellerStock = false;
+        if (!hasHubStock) {
+          hasSellerStock =
+            (await Product.countDocuments({
+              masterProductId: productLean._id,
+              ownerType: "seller",
+              status: "active",
+              stock: { $gt: 0 },
+            })) > 0;
+        }
+        if (!hasHubStock && !hasSellerStock) {
+          return handleResponse(res, 404, "Product not available");
+        }
+      } else {
+        const sellerIdForProduct = String(
+          productLean.sellerId?._id || productLean.sellerId,
+        );
+        if (!nearbySellerSet || !nearbySellerSet.has(sellerIdForProduct)) {
+          return handleResponse(res, 404, "Product not available in your area");
+        }
       }
     }
 
     const role = String(req.user?.role || "").toLowerCase();
-    const payload =
-      role === "admin"
-        ? product
-        : enrichCustomerProduct(
-            typeof product.toObject === "function" ? product.toObject() : product,
-          );
+    let payload = productLean;
+
+    if (role === "admin") {
+      payload = productLean;
+    } else if (enforceCustomerCatalog) {
+      const mapped = await mapSingleProductForCustomerCatalog(productLean);
+      payload = enrichCustomerProduct(mapped);
+    } else {
+      payload = enrichCustomerProduct(productLean);
+    }
 
     return handleResponse(res, 200, "Product details fetched", payload);
   } catch (error) {
