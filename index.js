@@ -9,7 +9,6 @@ import startSlaMonitorJob from "./app/jobs/slaMonitorJob.js";
 import cors from "cors"
 import { initSocket, getIO } from "./app/socket/socketManager.js"
 import { registerOrderSocketGetter } from "./app/services/orderSocketEmitter.js"
-
 dotenv.config();
 const app = express();
 const server = http.createServer(app);

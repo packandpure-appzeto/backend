@@ -2,6 +2,8 @@ import Razorpay from "razorpay";
 import crypto from "crypto";
 import handleResponse from "../utils/helper.js";
 import Order from "../models/order.js";
+import dotenv from "dotenv";
+dotenv.config();
 
 // Initialize Razorpay
 const razorpay = new Razorpay({
