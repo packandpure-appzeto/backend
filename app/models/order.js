@@ -95,6 +95,10 @@ const orderSchema = new mongoose.Schema(
       },
       total: Number,
     },
+    promotionApplied: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Promotion",
+    },
     status: {
       type: String,
       enum: [

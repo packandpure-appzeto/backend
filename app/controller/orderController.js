@@ -110,7 +110,7 @@ export const getDeliveryFee = async (req, res) => {
 export const placeOrder = async (req, res) => {
   try {
     const customerId = req.user.id;
-    const { address, payment, pricing, timeSlot, items } = req.body;
+    const { address, payment, pricing, timeSlot, items, promotionId } = req.body;
     const paymentMethod = normalizePaymentMethod(payment?.method);
     const customer = await User.findById(customerId).select(
       "walletBalance codBlocked codCancelCount",
@@ -337,8 +337,14 @@ export const placeOrder = async (req, res) => {
       hubStatus,
       procurementRequired: !hubPlan.fullyAvailable,
       slaDeadlineAt,
+      promotionApplied: promotionId || null,
     });
     await newOrder.save();
+
+    if (promotionId) {
+      // Import Promotion model at top of file, or just use mongoose.model
+      await mongoose.model("Promotion").findByIdAndUpdate(promotionId, { $inc: { usedCount: 1 } });
+    }
 
     // Reserve whatever hub stock is currently available (full or partial).
     const reserveResult = await reserveHubInventory(hubPlan.allocations, hubPlan.hubId);
