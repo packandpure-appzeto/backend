@@ -11,6 +11,7 @@ import {
     updateAdminPassword,
     getAdminStats,
     getDeliveryPartners,
+    getDeliveryPartnerById,
     approveDeliveryPartner,
     rejectDeliveryPartner,
     getActiveFleet,
@@ -113,6 +114,13 @@ router.get(
     verifyToken,
     allowRoles("admin"),
     getDeliveryPartners
+);
+
+router.get(
+    "/delivery-partners/:id",
+    verifyToken,
+    allowRoles("admin"),
+    getDeliveryPartnerById
 );
 
 router.patch(

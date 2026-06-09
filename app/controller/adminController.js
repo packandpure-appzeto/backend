@@ -3,6 +3,7 @@ import Admin from "../models/admin.js";
 import User from "../models/customer.js";
 import Seller from "../models/seller.js";
 import Delivery from "../models/delivery.js";
+import DeliveryActivity from "../models/deliveryActivity.js";
 import Order from "../models/order.js";
 import Product from "../models/product.js";
 import Transaction from "../models/transaction.js";
@@ -275,6 +276,51 @@ export const getDeliveryPartners = async (req, res) => {
       total,
       totalPages: Math.ceil(total / limit) || 1,
     });
+  } catch (error) {
+    return handleResponse(res, 500, error.message);
+  }
+};
+
+/* ===============================
+   GET DELIVERY PARTNER BY ID
+================================ */
+export const getDeliveryPartnerById = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const rider = await Delivery.findById(id).lean();
+    if (!rider) return handleResponse(res, 404, "Delivery Partner not found");
+
+    const recentOrders = await Order.find({ deliveryBoy: id })
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .populate("customer", "name")
+      .populate("seller", "shopName")
+      .lean();
+
+    const totalOrders = await Order.countDocuments({ deliveryBoy: id, status: "delivered" });
+
+    const earningsAggr = await Transaction.aggregate([
+      { $match: { user: new mongoose.Types.ObjectId(id), userModel: "Delivery", type: "Delivery Earning" } },
+      { $group: { _id: null, totalEarnings: { $sum: "$amount" } } }
+    ]);
+    const todayAggr = await Transaction.aggregate([
+      { $match: { user: new mongoose.Types.ObjectId(id), userModel: "Delivery", type: "Delivery Earning", createdAt: { $gte: new Date(new Date().setHours(0,0,0,0)) } } },
+      { $group: { _id: null, todayEarnings: { $sum: "$amount" } } }
+    ]);
+
+    const stats = {
+      totalOrders,
+      totalEarnings: earningsAggr[0]?.totalEarnings || 0,
+      todayEarnings: todayAggr[0]?.todayEarnings || 0,
+      rating: 4.8
+    };
+
+    const activityLogs = await DeliveryActivity.find({ deliveryBoy: id })
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .lean();
+
+    return handleResponse(res, 200, "Delivery partner details fetched successfully", { rider, recentOrders, stats, activityLogs });
   } catch (error) {
     return handleResponse(res, 500, error.message);
   }
