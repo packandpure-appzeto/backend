@@ -230,6 +230,7 @@ const validatePromoRules = async (promo, { cartTotal, items, customerId }) => {
 
 export const getAvailablePromotions = async (req, res) => {
     try {
+        const { customerId } = req.query;
         const now = new Date();
         const activePromotions = await Promotion.find({
             isActive: true,
@@ -237,7 +238,46 @@ export const getAvailablePromotions = async (req, res) => {
             $or: [{ validTill: null }, { validTill: { $gte: now } }]
         }).sort({ priority: -1, createdAt: -1 }).lean();
 
-        return handleResponse(res, 200, "Promotions fetched", activePromotions);
+        let filteredPromotions = activePromotions;
+
+        if (customerId) {
+            const userOrdersCount = await Order.countDocuments({ customer: customerId });
+            
+            filteredPromotions = [];
+            for (const promo of activePromotions) {
+                let isEligible = true;
+                
+                if (promo.conditions?.firstOrderOnly && userOrdersCount > 0) {
+                    isEligible = false;
+                }
+                
+                if (promo.conditions?.newUserOnly && userOrdersCount > 0) {
+                    isEligible = false;
+                }
+                
+                if (promo.conditions?.applicableUsers?.length > 0) {
+                    if (!promo.conditions.applicableUsers.map(id => id.toString()).includes(customerId)) {
+                        isEligible = false;
+                    }
+                }
+                
+                if (promo.perUserLimit) {
+                    const userUsageCount = await Order.countDocuments({ 
+                        customer: customerId, 
+                        promotionApplied: promo._id 
+                    });
+                    if (userUsageCount >= promo.perUserLimit) {
+                        isEligible = false;
+                    }
+                }
+                
+                if (isEligible) {
+                    filteredPromotions.push(promo);
+                }
+            }
+        }
+
+        return handleResponse(res, 200, "Promotions fetched", filteredPromotions);
     } catch (error) {
         return handleResponse(res, 500, error.message);
     }

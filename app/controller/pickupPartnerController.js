@@ -1,5 +1,19 @@
 import PickupPartner from "../models/pickupPartner.js";
 import PurchaseRequest from "../models/purchaseRequest.js";
+import Delivery from "../models/delivery.js";
+
+async function resolvePickupPartnerId(user) {
+  if (!user) return null;
+  if (user.role === 'pickup_partner') return user.id;
+  if (user.role === 'delivery') {
+    const delivery = await Delivery.findById(user.id).select('phone').lean();
+    if (delivery && delivery.phone) {
+      const pickupPartner = await PickupPartner.findOne({ phone: delivery.phone }).select('_id').lean();
+      if (pickupPartner) return String(pickupPartner._id);
+    }
+  }
+  return null;
+}
 import handleResponse from "../utils/helper.js";
 import getPagination from "../utils/pagination.js";
 import { generateOTP, useRealSMS } from "../utils/otp.js";
@@ -337,7 +351,8 @@ export const updatePickupPartnerProfile = async (req, res) => {
 
 export const getMyPickupAssignments = async (req, res) => {
   try {
-    const partnerId = req.user?.id;
+    const partnerId = await resolvePickupPartnerId(req.user);
+    if (!partnerId) return handleResponse(res, 403, "No linked PickupPartner account found. Please ask Admin to create one with the same phone number.");
     const { status = "active" } = req.query || {};
 
     const query = { pickupPartnerId: partnerId };
@@ -393,7 +408,8 @@ export const getMyPickupAssignments = async (req, res) => {
 
 export const markAssignmentPicked = async (req, res) => {
   try {
-    const partnerId = req.user?.id;
+    const partnerId = await resolvePickupPartnerId(req.user);
+    if (!partnerId) return handleResponse(res, 403, "No linked PickupPartner account found.");
     const { id } = req.params;
     const { otp, lat, lng, notes, vendorImageUrl } = req.body || {};
     const latitude = Number(lat);
@@ -495,7 +511,8 @@ export const markAssignmentPicked = async (req, res) => {
 
 export const markAssignmentHubDelivered = async (req, res) => {
   try {
-    const partnerId = req.user?.id;
+    const partnerId = await resolvePickupPartnerId(req.user);
+    if (!partnerId) return handleResponse(res, 403, "No linked PickupPartner account found.");
     const { id } = req.params;
     const { lat, lng, notes, hubImageUrl } = req.body || {};
     const latitude = Number(lat);

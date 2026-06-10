@@ -23,6 +23,17 @@ const deliverySchema = new mongoose.Schema(
         email: {
             type: String,
             trim: true,
+            lowercase: true,
+        },
+
+        aadharNumber: {
+            type: String,
+            trim: true,
+        },
+
+        panNumber: {
+            type: String,
+            trim: true,
         },
 
         address: {

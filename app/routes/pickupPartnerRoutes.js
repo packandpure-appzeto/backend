@@ -43,25 +43,25 @@ router.put(
 router.get(
   "/my/assignments",
   verifyToken,
-  allowRoles("pickup_partner", "admin"),
+  allowRoles("pickup_partner", "admin", "delivery"),
   getMyPickupAssignments,
 );
 router.post(
   "/my/assignments/:id/mark-picked",
   verifyToken,
-  allowRoles("pickup_partner", "admin"),
+  allowRoles("pickup_partner", "admin", "delivery"),
   markAssignmentPicked,
 );
 router.post(
   "/my/assignments/:id/mark-hub-delivered",
   verifyToken,
-  allowRoles("pickup_partner", "admin"),
+  allowRoles("pickup_partner", "admin", "delivery"),
   markAssignmentHubDelivered,
 );
 router.post(
   "/my/proofs/upload",
   verifyToken,
-  allowRoles("pickup_partner", "admin"),
+  allowRoles("pickup_partner", "admin", "delivery"),
   upload.single("image"),
   uploadPickupProofImage,
 );
