@@ -39,5 +39,8 @@ const deliveryActivitySchema = new mongoose.Schema(
 
 deliveryActivitySchema.index({ deliveryBoy: 1, createdAt: -1 });
 deliveryActivitySchema.index({ location: "2dsphere" });
+// TTL Index: Automatically delete documents after 7 days (7 * 24 * 60 * 60 = 604800 seconds)
+// This keeps the database lightweight and removes stale history.
+deliveryActivitySchema.index({ createdAt: 1 }, { expireAfterSeconds: 604800 });
 
 export default mongoose.model("DeliveryActivity", deliveryActivitySchema);

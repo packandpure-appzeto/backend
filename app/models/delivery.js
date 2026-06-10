@@ -60,6 +60,7 @@ const deliverySchema = new mongoose.Schema(
             aadhar: { type: String },
             pan: { type: String },
             drivingLicense: { type: String },
+            profileImage: { type: String },
         },
 
         vehicleNumber: {
