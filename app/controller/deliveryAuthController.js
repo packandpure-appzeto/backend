@@ -208,7 +208,7 @@ export const getDeliveryProfile = async (req, res) => {
 ================================ */
 export const updateDeliveryProfile = async (req, res) => {
     try {
-        const { name, vehicleType, vehicleNumber, drivingLicenseNumber, currentArea, isOnline } = req.body;
+        const { name, vehicleType, vehicleNumber, drivingLicenseNumber, currentArea, isOnline, profileImage } = req.body;
 
         const delivery = await Delivery.findById(req.user.id);
         if (!delivery) {
@@ -220,6 +220,10 @@ export const updateDeliveryProfile = async (req, res) => {
         if (vehicleNumber) delivery.vehicleNumber = vehicleNumber;
         if (drivingLicenseNumber) delivery.drivingLicenseNumber = drivingLicenseNumber;
         if (currentArea) delivery.currentArea = currentArea;
+        if (profileImage) {
+            delivery.documents = delivery.documents || {};
+            delivery.documents.profileImage = profileImage;
+        }
         let statusChanged = false;
         if (typeof isOnline !== 'undefined' && delivery.isOnline !== isOnline) {
             delivery.isOnline = isOnline;
