@@ -30,7 +30,23 @@ const userSchema = new mongoose.Schema(
             type: String,
             trim: true,
         },
+        businessAddress: {
+            type: String,
+            trim: true,
+        },
         contactPerson: {
+            type: String,
+            trim: true,
+        },
+        panNo: {
+            type: String,
+            trim: true,
+        },
+        gstNo: {
+            type: String,
+            trim: true,
+        },
+        fssaiNumber: {
             type: String,
             trim: true,
         },
