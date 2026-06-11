@@ -160,7 +160,7 @@ export const getCustomerProfile = async (req, res) => {
 ================================ */
 export const updateCustomerProfile = async (req, res) => {
     try {
-        const { name, email, addresses, businessName, contactPerson, avatar } =
+        const { name, email, addresses, businessName, businessAddress, contactPerson, panNo, gstNo, fssaiNumber, avatar } =
             req.body;
 
         const customer = await Customer.findById(req.user.id);
@@ -171,7 +171,11 @@ export const updateCustomerProfile = async (req, res) => {
         if (name !== undefined) customer.name = String(name).trim();
         if (email !== undefined) customer.email = email ? String(email).trim().toLowerCase() : undefined;
         if (businessName !== undefined) customer.businessName = businessName;
+        if (businessAddress !== undefined) customer.businessAddress = businessAddress;
         if (contactPerson !== undefined) customer.contactPerson = contactPerson;
+        if (panNo !== undefined) customer.panNo = panNo;
+        if (gstNo !== undefined) customer.gstNo = gstNo;
+        if (fssaiNumber !== undefined) customer.fssaiNumber = fssaiNumber;
         if (addresses !== undefined) customer.addresses = addresses;
         if (avatar !== undefined) customer.avatar = avatar ? String(avatar).trim() : "";
 
