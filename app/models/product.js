@@ -118,6 +118,10 @@ const productSchema = new mongoose.Schema(
       ref: "Category",
       required: true,
     },
+    /**
+     * admin = master catalog (customer-facing). One row per name + variant signature.
+     * seller = supplier supply listing (procurement price + stock). Links via masterProductId.
+     */
     ownerType: {
       type: String,
       enum: ["seller", "admin"],
@@ -158,6 +162,8 @@ productSchema.index({ categoryId: 1, status: 1 });
 productSchema.index({ subcategoryId: 1, status: 1 });
 productSchema.index({ sellerId: 1, status: 1 });
 productSchema.index({ ownerType: 1, status: 1, createdAt: -1 });
+productSchema.index({ ownerType: 1, name: 1, categoryId: 1 });
+productSchema.index({ masterProductId: 1, sellerId: 1 });
 productSchema.index({ name: "text", tags: "text" });
 
 /** Drop unique indexes for removed fields (sku, etc.) after schema changes. */

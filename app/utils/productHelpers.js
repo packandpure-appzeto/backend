@@ -17,6 +17,42 @@ export function normalizeUnit(unit, fallback = "Pieces") {
   return PRODUCT_UNITS.includes(u) ? u : fallback;
 }
 
+export function normalizeProductName(name) {
+  return String(name || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+/**
+ * Canonical variant identity for duplicate detection.
+ * Same product name + same signature = same catalog item.
+ * Different variant rows (name + unit) = allowed as a separate product.
+ */
+export function buildVariantSignature(variants = [], rootUnit = "Pieces") {
+  const unit = normalizeUnit(rootUnit);
+  const rows =
+    Array.isArray(variants) && variants.length > 0
+      ? variants
+      : [{ name: "default", unit }];
+
+  return rows
+    .map((v) => {
+      const n = String(v?.name || "default").trim().toLowerCase();
+      const u = normalizeUnit(v?.unit, unit).toLowerCase();
+      return `${n}|${u}`;
+    })
+    .sort()
+    .join(";");
+}
+
+export function variantsShareSignature(leftVariants, leftUnit, rightVariants, rightUnit) {
+  return (
+    buildVariantSignature(leftVariants, leftUnit) ===
+    buildVariantSignature(rightVariants, rightUnit)
+  );
+}
+
 export function parseVariantsField(raw) {
   if (Array.isArray(raw)) return raw;
   if (typeof raw === "string" && raw.trim()) {
@@ -184,6 +220,59 @@ export function catalogStockFromProduct(product) {
   const variantSum = totalVariantStock(product?.variants);
   if (variantSum > 0) return variantSum;
   return Math.max(0, Number(product?.stock) || 0);
+}
+
+/** MongoDB expression: variant sum or root stock (for aggregations). */
+export const MONGO_CATALOG_STOCK_EXPR = {
+  $cond: {
+    if: {
+      $and: [{ $isArray: "$variants" }, { $gt: [{ $size: "$variants" }, 0] }],
+    },
+    then: {
+      $reduce: {
+        input: "$variants",
+        initialValue: 0,
+        in: { $add: ["$$value", { $ifNull: ["$$this.stock", 0] }] },
+      },
+    },
+    else: { $ifNull: ["$stock", 0] },
+  },
+};
+
+/** Stock filter: in-stock if root or any variant has qty > 0. */
+export function buildSellerStockStatusQuery(stockStatus) {
+  if (stockStatus === "in") {
+    return {
+      $or: [{ stock: { $gt: 0 } }, { variants: { $elemMatch: { stock: { $gt: 0 } } } }],
+    };
+  }
+  if (stockStatus === "out") {
+    return {
+      $and: [
+        { $or: [{ stock: { $lte: 0 } }, { stock: { $exists: false } }] },
+        {
+          $or: [
+            { variants: { $exists: false } },
+            { variants: { $size: 0 } },
+            { variants: { $not: { $elemMatch: { stock: { $gt: 0 } } } } },
+          ],
+        },
+      ],
+    };
+  }
+  return null;
+}
+
+/** Enrich lean product row with normalized catalog stock fields. */
+export function enrichSellerProductRow(product) {
+  if (!product || typeof product !== "object") return product;
+  const catalogStock = catalogStockFromProduct(product);
+  return {
+    ...product,
+    stock: catalogStock,
+    catalogStock,
+    availableQtySeller: catalogStock,
+  };
 }
 
 /** Hub row qty (lean HubInventory or API-mapped row). */
@@ -393,4 +482,217 @@ export function mapVariantsForResponse(variants = [], priceOverride = null) {
       salePrice,
     };
   });
+}
+
+/** Seller listing mapped to an admin master catalog product. */
+export function isSellerCatalogLinkedListing(product) {
+  return product?.ownerType === "seller" && !!product?.masterProductId;
+}
+
+/**
+ * Merge seller price/stock updates into an existing catalog-linked listing.
+ * Variant names, units, and media stay tied to the master product.
+ */
+export function mergeSellerCatalogListingPricing(product, rawVariants, rootFields = {}) {
+  const existingVariants = Array.isArray(product?.variants)
+    ? product.variants.map((v) => (typeof v?.toObject === "function" ? v.toObject() : { ...v }))
+    : [];
+  const incoming = parseVariantsField(rawVariants);
+
+  if (existingVariants.length === 0) {
+    const iv = incoming[0] || {};
+    const price =
+      Number(iv.price ?? iv.salePrice ?? rootFields.price ?? product.price) || 0;
+    const stock = Math.max(
+      0,
+      Number(iv.stock ?? rootFields.stock ?? product.stock) || 0,
+    );
+    if (price <= 0) {
+      return { ok: false, message: "Supply price must be greater than 0" };
+    }
+    return {
+      ok: true,
+      data: {
+        price,
+        salePrice: price,
+        purchasePrice: price,
+        stock,
+        variants: [],
+      },
+    };
+  }
+
+  if (incoming.length > 0 && incoming.length !== existingVariants.length) {
+    return {
+      ok: false,
+      message:
+        "Cannot add or remove variants on hub catalog products. Update supply price and stock only.",
+    };
+  }
+
+  const merged = existingVariants.map((ev, idx) => {
+    const iv =
+      incoming[idx] ||
+      incoming.find(
+        (row) =>
+          String(row?.name || "")
+            .trim()
+            .toLowerCase() === String(ev?.name || "").trim().toLowerCase(),
+      ) ||
+      {};
+    const price = Number(iv.price ?? iv.salePrice);
+    const resolvedPrice =
+      Number.isFinite(price) && price > 0 ? price : Number(ev.price) || 0;
+    const stock = Math.max(0, Number(iv.stock ?? ev.stock) || 0);
+    return {
+      ...ev,
+      name: ev.name,
+      unit: ev.unit,
+      price: resolvedPrice,
+      salePrice: resolvedPrice,
+      purchasePrice: resolvedPrice,
+      stock,
+    };
+  });
+
+  const firstPrice = Number(merged[0]?.price) || Number(product.price) || 0;
+  if (firstPrice <= 0) {
+    return { ok: false, message: "Supply price must be greater than 0" };
+  }
+
+  return {
+    ok: true,
+    data: {
+      price: firstPrice,
+      salePrice: firstPrice,
+      purchasePrice: firstPrice,
+      stock: totalVariantStock(merged),
+      variants: normalizeVariants(merged, {
+        defaultUnit: product.unit,
+        basePrice: firstPrice,
+        baseSalePrice: firstPrice,
+      }),
+    },
+  };
+}
+
+/** Restrict seller updates on hub-catalog listings to price and stock only. */
+export function sanitizeSellerCatalogListingUpdate(product, productData, reqBody = {}) {
+  const merged = mergeSellerCatalogListingPricing(
+    product,
+    productData.variants ?? reqBody.variants,
+    {
+      price: productData.price ?? reqBody.price,
+      stock: productData.stock ?? reqBody.stock,
+    },
+  );
+  if (!merged.ok) return merged;
+  return { ok: true, data: merged.data };
+}
+
+/** Seller supply listing: procurement price + stock only (linked to a master catalog item). */
+export function sanitizeSellerSupplyListingUpdate(product, productData, reqBody = {}) {
+  if (isSellerCatalogLinkedListing(product) || product?.masterProductId) {
+    return sanitizeSellerCatalogListingUpdate(product, productData, reqBody);
+  }
+
+  const supply = Number(productData.price ?? reqBody.price ?? productData.salePrice);
+  const stock = Math.max(0, Number(productData.stock ?? reqBody.stock ?? product.stock) || 0);
+
+  if (Number.isFinite(supply) && supply > 0) {
+    return {
+      ok: true,
+      data: {
+        price: supply,
+        salePrice: supply,
+        purchasePrice: supply,
+        stock,
+      },
+    };
+  }
+
+  if (productData.stock !== undefined || reqBody.stock !== undefined) {
+    return { ok: true, data: { stock } };
+  }
+
+  return {
+    ok: false,
+    message: "Sellers can only update supply price and stock on live listings.",
+  };
+}
+
+/**
+ * Pending seller-owned submission (no master yet): allow descriptive fields,
+ * but customer MRP / selling price / images on master are admin-only after go-live.
+ */
+export function sanitizeSellerPendingSubmissionUpdate(product, productData, reqBody = {}) {
+  const allowed = {};
+  const textKeys = ["name", "description", "brand", "weight", "categoryId", "subcategoryId", "unit", "tags"];
+  for (const key of textKeys) {
+    if (productData[key] !== undefined) allowed[key] = productData[key];
+  }
+
+  if (productData.lowStockAlert !== undefined) {
+    allowed.lowStockAlert = productData.lowStockAlert;
+  }
+
+  const supply = Number(productData.price ?? reqBody.price ?? productData.salePrice);
+  if (Number.isFinite(supply) && supply > 0) {
+    allowed.price = supply;
+    allowed.salePrice = supply;
+    allowed.purchasePrice = supply;
+  }
+
+  if (productData.stock !== undefined || reqBody.stock !== undefined) {
+    allowed.stock = Math.max(0, Number(productData.stock ?? reqBody.stock) || 0);
+  }
+
+  if (productData.variants !== undefined || reqBody.variants !== undefined) {
+    const raw = parseVariantsField(productData.variants ?? reqBody.variants);
+    if (raw.length > 0) {
+      const baseSupply = Number.isFinite(supply) && supply > 0 ? supply : Number(product.price) || 0;
+      allowed.variants = normalizeVariants(raw, {
+        defaultUnit: allowed.unit || product.unit,
+        basePrice: baseSupply,
+        baseSalePrice: baseSupply,
+      }).map((v) => ({
+        ...v,
+        price: Number(v.price) > 0 ? v.price : baseSupply,
+        salePrice: Number(v.salePrice) > 0 ? v.salePrice : baseSupply,
+        purchasePrice: Number(v.purchasePrice) > 0 ? v.purchasePrice : baseSupply,
+      }));
+      allowed.stock = totalVariantStock(allowed.variants);
+    }
+  }
+
+  return { ok: true, data: allowed, allowImages: true };
+}
+
+/** Route seller updates: catalog-linked / live = supply only; pending = submission fields. */
+export function sanitizeSellerProductUpdate(product, productData, reqBody = {}) {
+  const isPendingOwn =
+    product?.ownerType === "seller" &&
+    !product?.masterProductId &&
+    String(product?.status || "") === "pending_approval";
+
+  if (isPendingOwn) {
+    return sanitizeSellerPendingSubmissionUpdate(product, productData, reqBody);
+  }
+
+  return sanitizeSellerSupplyListingUpdate(product, productData, reqBody);
+}
+
+/** Copy master catalog presentation fields onto a seller listing payload. */
+export function inheritMasterCatalogFields(productData, master) {
+  if (!master) return productData;
+  productData.name = master.name;
+  productData.description = master.description || "";
+  productData.brand = master.brand || "";
+  productData.weight = master.weight || "";
+  productData.unit = master.unit || productData.unit;
+  productData.categoryId = master.categoryId;
+  productData.subcategoryId = master.subcategoryId;
+  productData.mainImage = master.mainImage || null;
+  productData.galleryImages = Array.isArray(master.galleryImages) ? master.galleryImages : [];
+  return productData;
 }

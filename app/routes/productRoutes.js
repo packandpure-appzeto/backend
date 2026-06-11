@@ -6,7 +6,9 @@ import {
     updateProduct,
     updateVariantStock,
     deleteProduct,
-    getProductById
+    getProductById,
+    getSellerProductGoLivePreview,
+    publishSellerProductGoLive,
 } from "../controller/productController.js";
 import { adjustStock, getStockHistory } from "../controller/stockController.js";
 import { verifyToken, allowRoles, isAccountVerified } from "../middleware/authMiddleware.js";
@@ -35,6 +37,19 @@ router.post(
     verifyToken,
     allowRoles("seller", "admin"),
     updateVariantStock
+);
+
+router.get(
+    "/:id/go-live-preview",
+    verifyToken,
+    allowRoles("admin"),
+    getSellerProductGoLivePreview,
+);
+router.post(
+    "/:id/go-live",
+    verifyToken,
+    allowRoles("admin"),
+    publishSellerProductGoLive,
 );
 
 router.get("/:id", getProductById);

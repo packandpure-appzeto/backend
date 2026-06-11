@@ -13,6 +13,7 @@ import PickupPartner from "../models/pickupPartner.js";
 import handleResponse from "../utils/helper.js";
 import getPagination from "../utils/pagination.js";
 import Category from "../models/category.js";
+import { MONGO_CATALOG_STOCK_EXPR } from "../utils/productHelpers.js";
 
 /** Use Cloudinary `avatar` when set; otherwise Dicebear placeholder */
 const customerAvatarProjection = {
@@ -863,7 +864,72 @@ export const getSellers = async (req, res) => {
     if (verified === "true" || verified === true) query.isVerified = true;
     else if (verified === "false" || verified === false) query.isVerified = false;
     const sellers = await Seller.find(query).select("-password -__v").sort({ createdAt: -1 }).lean();
-    return handleResponse(res, 200, "Sellers fetched", { items: sellers, total: sellers.length });
+
+    const sellerIds = sellers.map((s) => s._id).filter(Boolean);
+    const productStatsMap = new Map();
+
+    if (sellerIds.length > 0) {
+      const productStats = await Product.aggregate([
+        {
+          $match: {
+            ownerType: "seller",
+            sellerId: { $in: sellerIds },
+          },
+        },
+        {
+          $group: {
+            _id: "$sellerId",
+            totalProducts: { $sum: 1 },
+            activeProducts: {
+              $sum: { $cond: [{ $eq: ["$status", "active"] }, 1, 0] },
+            },
+            pendingProducts: {
+              $sum: { $cond: [{ $eq: ["$status", "pending_approval"] }, 1, 0] },
+            },
+            inStockProducts: {
+              $sum: {
+                $cond: [{ $gt: [MONGO_CATALOG_STOCK_EXPR, 0] }, 1, 0],
+              },
+            },
+            totalStock: { $sum: MONGO_CATALOG_STOCK_EXPR },
+          },
+        },
+      ]);
+
+      productStats.forEach((row) => {
+        if (row._id) {
+          productStatsMap.set(String(row._id), {
+            totalProducts: Number(row.totalProducts) || 0,
+            activeProducts: Number(row.activeProducts) || 0,
+            pendingProducts: Number(row.pendingProducts) || 0,
+            inStockProducts: Number(row.inStockProducts) || 0,
+            outOfStockProducts: Math.max(
+              0,
+              (Number(row.totalProducts) || 0) - (Number(row.inStockProducts) || 0),
+            ),
+            totalStock: Number(row.totalStock) || 0,
+          });
+        }
+      });
+    }
+
+    const items = sellers.map((seller) => {
+      const stats = productStatsMap.get(String(seller._id)) || {
+        totalProducts: 0,
+        activeProducts: 0,
+        pendingProducts: 0,
+        inStockProducts: 0,
+        outOfStockProducts: 0,
+        totalStock: 0,
+      };
+      return {
+        ...seller,
+        productStats: stats,
+        productCount: stats.totalProducts,
+      };
+    });
+
+    return handleResponse(res, 200, "Sellers fetched", { items, total: items.length });
   } catch (error) {
     return handleResponse(res, 500, error.message);
   }
@@ -876,15 +942,95 @@ export const getSellerById = async (req, res) => {
   try {
     const { id } = req.params;
     if (!mongoose.Types.ObjectId.isValid(id)) return handleResponse(res, 400, "Invalid seller ID");
-    const seller = await Seller.findById(id).lean();
+    const seller = await Seller.findById(id).select("-password -otp -otpExpiry").lean();
     if (!seller) return handleResponse(res, 404, "Seller not found");
-    const [totalOrders, totalRevenue, recentOrders] = await Promise.all([
+
+    const coords = seller?.location?.coordinates;
+    const coordsLabel =
+      Array.isArray(coords) && coords.length >= 2
+        ? `${Number(coords[1]).toFixed(4)}, ${Number(coords[0]).toFixed(4)}`
+        : null;
+    const locationText =
+      (typeof seller.address === "string" && seller.address.trim())
+        ? seller.address.trim()
+        : coordsLabel || "Not mapped";
+    const [totalOrders, totalRevenue, recentOrders, productStatsRows, sellerProducts] = await Promise.all([
       Order.countDocuments({ seller: id }),
       Order.aggregate([{ $match: { seller: new mongoose.Types.ObjectId(id), status: "delivered" } }, { $group: { _id: null, total: { $sum: "$pricing.total" } } }]),
-      Order.find({ seller: id }).sort({ createdAt: -1 }).limit(10).populate("customer", "name phone")
+      Order.find({ seller: id }).sort({ createdAt: -1 }).limit(10).populate("customer", "name phone"),
+      Product.aggregate([
+        { $match: { sellerId: new mongoose.Types.ObjectId(id), ownerType: "seller" } },
+        {
+          $group: {
+            _id: null,
+            totalProducts: { $sum: 1 },
+            activeProducts: { $sum: { $cond: [{ $eq: ["$status", "active"] }, 1, 0] } },
+            pendingProducts: { $sum: { $cond: [{ $eq: ["$status", "pending_approval"] }, 1, 0] } },
+            inStockProducts: { $sum: { $cond: [{ $gt: [MONGO_CATALOG_STOCK_EXPR, 0] }, 1, 0] } },
+            totalStock: { $sum: MONGO_CATALOG_STOCK_EXPR },
+          },
+        },
+      ]),
+      Product.find({ sellerId: id, ownerType: "seller" })
+        .select("name status stock variants masterProductId purchasePrice createdAt")
+        .populate("masterProductId", "name")
+        .sort({ createdAt: -1 })
+        .limit(50)
+        .lean(),
     ]);
-    const stats = { totalOrders, totalRevenue: totalRevenue[0]?.total || 0, recentOrders: recentOrders.map(o => ({ id: o.orderId, customer: o.customer?.name || "Guest", status: o.status, amount: o.pricing.total, date: o.createdAt })) };
-    return handleResponse(res, 200, "Seller details fetched", { ...seller, stats });
+
+    const productAgg = productStatsRows[0] || {};
+    const productStats = {
+      totalProducts: Number(productAgg.totalProducts) || 0,
+      activeProducts: Number(productAgg.activeProducts) || 0,
+      pendingProducts: Number(productAgg.pendingProducts) || 0,
+      inStockProducts: Number(productAgg.inStockProducts) || 0,
+      outOfStockProducts: Math.max(
+        0,
+        (Number(productAgg.totalProducts) || 0) - (Number(productAgg.inStockProducts) || 0),
+      ),
+      totalStock: Number(productAgg.totalStock) || 0,
+    };
+
+    const stats = {
+      totalOrders,
+      totalRevenue: totalRevenue[0]?.total || 0,
+      recentOrders: recentOrders.map((o) => ({
+        id: o.orderId || String(o._id),
+        customer: o.customer?.name || "Guest",
+        status: o.status || "pending",
+        amount: Number(o.pricing?.total) || 0,
+        date: o.createdAt,
+      })),
+      productStats,
+    };
+
+    const products = sellerProducts.map((p) => {
+      const variantSum = (p.variants || []).reduce((s, v) => s + (Number(v?.stock) || 0), 0);
+      const catalogStock = variantSum > 0 ? variantSum : Math.max(0, Number(p.stock) || 0);
+      return {
+        _id: p._id,
+        name: p.name,
+        status: p.status,
+        stock: catalogStock,
+        purchasePrice: p.purchasePrice,
+        masterProductName: p.masterProductId?.name || null,
+        masterProductId: p.masterProductId?._id || p.masterProductId || null,
+        createdAt: p.createdAt,
+      };
+    });
+
+    return handleResponse(res, 200, "Seller details fetched", {
+      ...seller,
+      locationText,
+      walletBalance: Number(seller.walletBalance) || 0,
+      rating: Number(seller.rating) || 0,
+      commissionRate: seller.commissionRate ?? "N/A",
+      stats,
+      productStats,
+      productCount: productStats.totalProducts,
+      products,
+    });
   } catch (error) {
     return handleResponse(res, 500, error.message);
   }

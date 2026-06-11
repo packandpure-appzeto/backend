@@ -26,7 +26,20 @@ import {
   resolveVariantIndex,
   setVariantStockAtIndex,
   variantStockRequiresSelection,
+  MONGO_CATALOG_STOCK_EXPR,
+  buildSellerStockStatusQuery,
+  enrichSellerProductRow,
+  isSellerCatalogLinkedListing,
+  sanitizeSellerCatalogListingUpdate,
+  sanitizeSellerProductUpdate,
+  mergeSellerCatalogListingPricing,
+  inheritMasterCatalogFields,
+  buildVariantSignature,
 } from "../utils/productHelpers.js";
+import {
+  findMasterByNameAndVariants,
+  formatMasterMatchResponse,
+} from "../utils/productMatching.js";
 import {
   parseCustomerCoordinates,
   getNearbySellerIdsForCustomer,
@@ -62,6 +75,73 @@ function normalizeOptionalString(value) {
 }
 
 const DEFAULT_HUB_ID = process.env.DEFAULT_HUB_ID || "MAIN_HUB";
+
+function escapeRegex(str) {
+  return String(str || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Per-master seller supply rows for admin catalog (all seller listings, any status). */
+async function fetchSellerSupplyBreakdownByMaster(masterObjectIds) {
+  const map = new Map();
+  if (!Array.isArray(masterObjectIds) || !masterObjectIds.length) return map;
+
+  const rows = await Product.aggregate([
+    {
+      $match: {
+        masterProductId: { $in: masterObjectIds },
+        ownerType: "seller",
+      },
+    },
+    {
+      $lookup: {
+        from: "sellers",
+        localField: "sellerId",
+        foreignField: "_id",
+        as: "sellerDoc",
+      },
+    },
+    {
+      $addFields: {
+        catalogStock: MONGO_CATALOG_STOCK_EXPR,
+        shopName: {
+          $ifNull: [{ $arrayElemAt: ["$sellerDoc.shopName", 0] }, "Unknown Supplier"],
+        },
+        sellerName: { $arrayElemAt: ["$sellerDoc.name", 0] },
+      },
+    },
+    {
+      $project: {
+        masterProductId: 1,
+        sellerId: 1,
+        name: 1,
+        status: 1,
+        catalogStock: 1,
+        shopName: 1,
+        sellerName: 1,
+        purchasePrice: 1,
+      },
+    },
+    { $sort: { catalogStock: -1, shopName: 1 } },
+  ]);
+
+  rows.forEach((row) => {
+    const mid = row.masterProductId ? String(row.masterProductId) : null;
+    if (!mid) return;
+    if (!map.has(mid)) map.set(mid, []);
+    map.get(mid).push({
+      sellerId: row.sellerId,
+      productId: row._id,
+      shopName: row.shopName || "Unknown Supplier",
+      sellerName: row.sellerName || "",
+      productName: row.name,
+      status: row.status,
+      stock: Math.max(0, Number(row.catalogStock) || 0),
+      purchasePrice: Number(row.purchasePrice) || 0,
+    });
+  });
+
+  return map;
+}
 
 function hubInventoryStatus(availableQty, reorderLevel = 10) {
   const qty = Math.max(0, Number(availableQty) || 0);
@@ -326,6 +406,22 @@ export const getProducts = async (req, res) => {
     const masterIds = products.map(p => p.masterProductId).filter(Boolean);
     const masterProducts = masterIds.length > 0 ? await Product.find({ _id: { $in: masterIds } }).select('price salePrice').lean() : [];
 
+    const adminMasterIdsForBreakdown = products
+      .filter((p) => p.ownerType === "admin")
+      .map((p) => p._id)
+      .filter((id) => mongoose.Types.ObjectId.isValid(String(id)));
+
+    let sellerSupplyBreakdownMap = new Map();
+    if (isAdminCatalogRequest && adminMasterIdsForBreakdown.length > 0) {
+      try {
+        sellerSupplyBreakdownMap = await fetchSellerSupplyBreakdownByMaster(
+          adminMasterIdsForBreakdown.map((id) => new mongoose.Types.ObjectId(String(id))),
+        );
+      } catch (err) {
+        console.warn("[getProducts] seller supply breakdown:", err.message);
+      }
+    }
+
     const productsWithSource = products.map((p) => {
       const pIdStr = String(p._id);
       const hubQty = hubMap.get(pIdStr) ?? 0;
@@ -338,6 +434,12 @@ export const getProducts = async (req, res) => {
         const dynamicPrice =
           hubRow?.sellPrice && hubRow.sellPrice > 0 ? hubRow.sellPrice : p.salePrice || p.price;
         const hasVariants = Array.isArray(p.variants) && p.variants.length > 0;
+
+        const sellerSupplyBreakdown = sellerSupplyBreakdownMap.get(pIdStr) || [];
+        const linkedSellerCount = sellerSupplyBreakdown.length;
+        const activeSellerCount = sellerSupplyBreakdown.filter(
+          (row) => row.status === "active",
+        ).length;
 
         return {
           ...p,
@@ -353,6 +455,9 @@ export const getProducts = async (req, res) => {
           variants: mapVariantsForResponse(p.variants),
           fulfillmentSource:
             hubQty > 0 ? "hub" : mappedSellerStock > 0 ? "procure" : "out_of_stock",
+          sellerSupplyBreakdown,
+          linkedSellerCount,
+          activeSellerCount,
         };
       }
 
@@ -428,12 +533,9 @@ export const getSellerProducts = async (req, res) => {
       maxLimit: 100,
     });
 
-    const query = { sellerId };
-    if (stockStatus === "in") {
-      query.stock = { $gt: 0 };
-    } else if (stockStatus === "out") {
-      query.stock = 0;
-    }
+    const query = { sellerId, ownerType: "seller" };
+    const stockFilter = buildSellerStockStatusQuery(stockStatus);
+    if (stockFilter) Object.assign(query, stockFilter);
 
     const results = await Product.find(query)
       .sort({ createdAt: -1 })
@@ -448,19 +550,30 @@ export const getSellerProducts = async (req, res) => {
       })
       .lean();
 
-    // DYNAMIC STOCK SYNC: If master product, sum Hub + Seller stocks
-    const finalItems = await Promise.all(results.map(async (p) => {
-      if (p.ownerType === 'admin') {
-        const hRows = await HubInventory.find({ productId: p._id }).lean();
-        const sRows = await Product.find({ masterProductId: p._id, ownerType: 'seller', status: 'active' }).select('stock').lean();
-        const hQty = hRows.reduce((s, r) => s + Number(r.hubStockQuantity || 0), 0);
-        const sQty = sRows.reduce((s, r) => s + Number(r.stock || 0), 0);
-        return { ...p, stock: hQty + sQty, hQty, sQty };
-      }
-      return p;
-    }));
+    const finalItems = results.map((p) => enrichSellerProductRow(p));
 
-    const total = await Product.countDocuments(query);
+    const [total, statusCounts] = await Promise.all([
+      Product.countDocuments(query),
+      Product.aggregate([
+        { $match: { sellerId: new mongoose.Types.ObjectId(String(sellerId)), ownerType: "seller" } },
+        {
+          $group: {
+            _id: null,
+            total: { $sum: 1 },
+            active: { $sum: { $cond: [{ $eq: ["$status", "active"] }, 1, 0] } },
+            pending: { $sum: { $cond: [{ $eq: ["$status", "pending_approval"] }, 1, 0] } },
+            inStock: {
+              $sum: {
+                $cond: [{ $gt: [MONGO_CATALOG_STOCK_EXPR, 0] }, 1, 0],
+              },
+            },
+            totalStock: { $sum: MONGO_CATALOG_STOCK_EXPR },
+          },
+        },
+      ]),
+    ]);
+
+    const statsRow = statusCounts[0] || {};
 
     return handleResponse(res, 200, "Products fetched successfully", {
       items: finalItems,
@@ -468,6 +581,14 @@ export const getSellerProducts = async (req, res) => {
       limit: Number(limit),
       total,
       totalPages: Math.ceil(total / limit) || 1,
+      stats: {
+        total: Number(statsRow.total) || 0,
+        active: Number(statsRow.active) || 0,
+        pending: Number(statsRow.pending) || 0,
+        inStock: Number(statsRow.inStock) || 0,
+        outOfStock: Math.max(0, (Number(statsRow.total) || 0) - (Number(statsRow.inStock) || 0)),
+        totalStock: Number(statsRow.totalStock) || 0,
+      },
     });
   } catch (error) {
     return handleResponse(res, 500, error.message);
@@ -503,7 +624,7 @@ export const createProduct = async (req, res) => {
     if (role === "admin") {
       productData.ownerType = "admin";
       productData.sellerId = null;
-      productData.status = productData.status || "active";
+      productData.status = "active";
     } else {
       productData.ownerType = "seller";
       productData.sellerId = req.user.id;
@@ -521,7 +642,7 @@ export const createProduct = async (req, res) => {
       }
     }
 
-    if (req.files) {
+    if (req.files && !(role !== "admin" && productData.masterProductId)) {
       if (req.files.mainImage && req.files.mainImage[0]) {
         productData.mainImage = await uploadToCloudinary(req.files.mainImage[0].buffer, "products");
       }
@@ -531,7 +652,64 @@ export const createProduct = async (req, res) => {
       }
     }
 
+    // Catalog listing: seller may only set supply price/stock; everything else comes from master.
+    if (role !== "admin" && productData.masterProductId) {
+      const existingListing = await Product.findOne({
+        sellerId: req.user.id,
+        masterProductId: productData.masterProductId,
+        ownerType: "seller",
+      }).select("_id name");
+
+      if (existingListing) {
+        return handleResponse(
+          res,
+          400,
+          `You already list "${existingListing.name}". Update supply price and stock from Products or Hub Catalog.`,
+        );
+      }
+
+      const masterForCopy = await Product.findById(productData.masterProductId)
+        .select(
+          "name description mainImage galleryImages brand weight unit categoryId subcategoryId variants",
+        )
+        .lean();
+
+      if (masterForCopy) {
+        inheritMasterCatalogFields(productData, masterForCopy);
+
+        if (Array.isArray(masterForCopy.variants) && masterForCopy.variants.length > 0) {
+          const sellerVars = parseVariantsField(productData.variants);
+          const merged = mergeSellerCatalogListingPricing(
+            { ...productData, variants: masterForCopy.variants, unit: masterForCopy.unit },
+            sellerVars,
+          );
+          if (merged.ok) {
+            Object.assign(productData, merged.data);
+          }
+        }
+      }
+    }
+
     applyVariantsToProductData(productData);
+
+    if (role === "admin") {
+      const duplicateMaster = await findMasterByNameAndVariants({
+        name: productData.name,
+        variants: productData.variants,
+        unit: productData.unit,
+        categoryId: productData.categoryId,
+        subcategoryId: productData.subcategoryId,
+      });
+
+      if (duplicateMaster) {
+        return handleResponse(
+          res,
+          409,
+          `Master catalog already has "${duplicateMaster.name}" with the same variant options. Update the existing product instead.`,
+          { existingMaster: formatMasterMatchResponse(duplicateMaster) },
+        );
+      }
+    }
 
     if (effectiveSellingPrice(productData) <= 0) {
       return handleResponse(res, 400, "Selling price (salePrice) must be greater than 0");
@@ -552,34 +730,72 @@ export const createProduct = async (req, res) => {
     // --- HUB-FIRST CATALOG MAPPING (Only for Sellers) ---
     if (role !== "admin") {
       if (!productData.masterProductId) {
-        const normalizedName = String(productData.name || "").trim();
-        // Check if an EXACT master product already exists to auto-link
-        const existingMaster = await Product.findOne({
-          name: { $regex: new RegExp(`^${normalizedName}$`, "i") },
-          ownerType: "admin"
+        const existingMaster = await findMasterByNameAndVariants({
+          name: productData.name,
+          variants: productData.variants,
+          unit: productData.unit,
+          categoryId: productData.categoryId,
+          subcategoryId: productData.subcategoryId,
         });
 
         if (existingMaster) {
           productData.masterProductId = existingMaster._id;
-          if (!productData.categoryId) productData.categoryId = existingMaster.categoryId;
-          if (!productData.subcategoryId) productData.subcategoryId = existingMaster.subcategoryId;
-          if (!productData.unit) productData.unit = existingMaster.unit;
+          inheritMasterCatalogFields(productData, existingMaster);
+
+          if (Array.isArray(existingMaster.variants) && existingMaster.variants.length > 0) {
+            const sellerVars = parseVariantsField(productData.variants);
+            const merged = mergeSellerCatalogListingPricing(
+              { ...productData, variants: existingMaster.variants, unit: existingMaster.unit },
+              sellerVars,
+            );
+            if (merged.ok) {
+              Object.assign(productData, merged.data);
+            }
+          }
         } else {
-          // IMPORTANT: We NO LONGER auto-create a master product here.
-          // The item stays as masterProductId: null until Admin maps it during approval.
+          // Stays unlinked until admin Go Live creates or links the master catalog copy.
           productData.masterProductId = null;
         }
       }
 
-      // Seller-Specific Duplicate Check
+      // One seller listing per master product (same name + variant combo).
       if (productData.masterProductId) {
         const alreadyExists = await Product.findOne({
           sellerId: req.user.id,
-          masterProductId: productData.masterProductId
+          masterProductId: productData.masterProductId,
+          ownerType: "seller",
         });
         if (alreadyExists) {
-          return handleResponse(res, 400, "You have already listed this product.");
+          return handleResponse(
+            res,
+            400,
+            `You already list "${alreadyExists.name}" with these variants. Update supply price and stock instead.`,
+          );
         }
+      } else {
+        const ownDuplicate = await Product.findOne({
+          sellerId: req.user.id,
+          ownerType: "seller",
+          masterProductId: null,
+          status: { $in: ["pending_approval", "active"] },
+          name: { $regex: new RegExp(`^${escapeRegex(String(productData.name || "").trim())}$`, "i") },
+        }).lean();
+
+        if (
+          ownDuplicate &&
+          buildVariantSignature(ownDuplicate.variants, ownDuplicate.unit) ===
+            buildVariantSignature(productData.variants, productData.unit)
+        ) {
+          return handleResponse(
+            res,
+            400,
+            `You already submitted "${ownDuplicate.name}" with the same variants. Edit the existing listing instead.`,
+          );
+        }
+      }
+
+      if (productData.masterProductId) {
+        productData.status = "active";
       }
     }
 
@@ -687,6 +903,30 @@ export const updateProduct = async (req, res) => {
       delete productData.keepGalleryImages;
     }
 
+    const sellerManagedListing = role !== "admin" && product.ownerType === "seller";
+
+    if (sellerManagedListing) {
+      const sanitized = sanitizeSellerProductUpdate(product, productData, req.body);
+      if (!sanitized.ok) {
+        return handleResponse(res, 400, sanitized.message);
+      }
+      for (const key of Object.keys(productData)) {
+        delete productData[key];
+      }
+      Object.assign(productData, sanitized.data);
+
+      const blockImages =
+        isSellerCatalogLinkedListing(product) ||
+        product.masterProductId ||
+        !sanitized.allowImages;
+
+      if (blockImages && req.files) {
+        delete req.files.mainImage;
+        delete req.files.galleryImages;
+        delete req.files.images;
+      }
+    }
+
     if (role === "admin" && product.ownerType === "seller") {
       let parsedVars = [];
       if (typeof productData.variants === "string") {
@@ -718,11 +958,14 @@ export const updateProduct = async (req, res) => {
           }
         }
       } else if (sellPrice > 0) {
-        let existingMaster = await Product.findOne({
-          name: { $regex: new RegExp(`^${String(product.name || '').trim()}$`, "i") },
-          ownerType: "admin"
+        let existingMaster = await findMasterByNameAndVariants({
+          name: product.name,
+          variants: parsedVars.length > 0 ? parsedVars : product.variants,
+          unit: product.unit,
+          categoryId: product.categoryId,
+          subcategoryId: product.subcategoryId,
         });
-        
+
         if (!existingMaster) {
           const masterSlug = await ensureUniqueSlug(`${product.name}-master`);
 
@@ -757,11 +1000,11 @@ export const updateProduct = async (req, res) => {
           existingMaster = new Product(newMasterData);
           await existingMaster.save();
         } else {
-          existingMaster.price = sellPrice;
-          existingMaster.salePrice = sellPrice;
-          await existingMaster.save();
+          await Product.findByIdAndUpdate(existingMaster._id, {
+            $set: { price: sellPrice, salePrice: sellPrice },
+          });
         }
-        
+
         productData.masterProductId = existingMaster._id;
       }
 
@@ -772,16 +1015,13 @@ export const updateProduct = async (req, res) => {
       delete productData.sellerId;
     } else if (role !== "admin") {
       delete productData.sellerId;
-      
-      // SOP: If seller is ONLY updating stock/images, don't force re-approval
-      // If name, price or category changes, then it must go back to pending
-      const sensitiveFields = ['name', 'price', 'salePrice', 'categoryId', 'subcategoryId'];
-      const isSensitiveChange = sensitiveFields.some(f => productData[f] !== undefined && String(productData[f]) !== String(product[f]));
-      
-      if (isSensitiveChange) {
-        productData.status = "pending_approval";
+
+      if (product.masterProductId || isSellerCatalogLinkedListing(product)) {
+        delete productData.status;
+      } else if (product.status === "pending_approval") {
+        delete productData.status;
       } else {
-        delete productData.status; // Keep existing status (active/rejected/etc)
+        delete productData.status;
       }
     }
 
@@ -841,15 +1081,22 @@ export const updateProduct = async (req, res) => {
       delete productData.variantName;
     }
 
-    if (hasVariantsPayload) {
+    const sellerCatalogOrLive =
+      role !== "admin" &&
+      product.ownerType === "seller" &&
+      (product.masterProductId || isSellerCatalogLinkedListing(product));
+
+    if (hasVariantsPayload && !sellerCatalogOrLive) {
       const rawVariants = parseVariantsField(req.body.variants ?? productData.variants);
       const defaultUnit = normalizeUnit(productData.unit ?? product.unit);
       productData.unit = defaultUnit;
       if (rawVariants.length > 0) {
+        const basePrice = Number(productData.price ?? product.price) || 0;
+        const baseSale = Number(productData.salePrice ?? product.salePrice) || basePrice;
         productData.variants = normalizeVariants(rawVariants, {
           defaultUnit,
-          basePrice: Number(productData.price ?? product.price) || 0,
-          baseSalePrice: Number(productData.salePrice ?? product.salePrice) || 0,
+          basePrice,
+          baseSalePrice: baseSale,
         });
         syncRootFromFirstVariant(productData);
         if (productData.price === undefined && productData.variants[0]) {
@@ -1019,67 +1266,21 @@ export const updateProduct = async (req, res) => {
       
       // 1. Try to find an existing master if not linked
       if (!mid) {
-        const matchingMaster = await Product.findOne({
-          name: { $regex: new RegExp(`^${updatedProduct.name}$`, "i") },
-          ownerType: "admin"
+        const matchingMaster = await findMasterByNameAndVariants({
+          name: updatedProduct.name,
+          variants: updatedProduct.variants,
+          unit: updatedProduct.unit,
+          categoryId: updatedProduct.categoryId,
+          subcategoryId: updatedProduct.subcategoryId,
         });
         if (matchingMaster) {
           mid = matchingMaster._id;
-          // Link it now so future edits are consistent
           await Product.findByIdAndUpdate(updatedProduct._id, { masterProductId: mid });
         }
       }
       
-      // 2. PROMOTION: If still no master and admin is activating, create a Master Record automatically
-      if (!mid && currentStatus === "active") {
-        try {
-          console.log(`[updateProduct] No master found for ${updatedProduct.name}. Promoting to Master Catalog...`);
-          
-          const masterSlug = await ensureUniqueSlug(`${updatedProduct.name}-master`);
-          const promotedVariants = normalizeVariants(updatedProduct.variants || [], {
-            defaultUnit: updatedProduct.unit,
-            basePrice: customerPrice || updatedProduct.price,
-            baseSalePrice: customerPrice || updatedProduct.salePrice,
-          });
+      // Master catalog copies are created via POST /products/:id/go-live (admin Go Live flow).
 
-          const newMaster = new Product({
-            name: updatedProduct.name,
-            slug: masterSlug,
-            ownerType: "admin",
-            status: "active",
-            categoryId: updatedProduct.categoryId,
-            subcategoryId: updatedProduct.subcategoryId,
-            unit: normalizeUnit(updatedProduct.unit),
-            mainImage: updatedProduct.mainImage,
-            galleryImages: updatedProduct.galleryImages,
-            description: updatedProduct.description,
-            price: customerPrice || updatedProduct.price,
-            salePrice: customerPrice || updatedProduct.salePrice,
-            purchasePrice: updatedProduct.price,
-            stock: totalVariantStock(promotedVariants),
-            variants: promotedVariants,
-          });
-          
-          const savedMaster = await newMaster.save();
-          mid = savedMaster._id;
-          
-          // Link the seller product to this new master
-          await Product.findByIdAndUpdate(updatedProduct._id, { masterProductId: mid });
-          
-          // Initialize Hub Inventory for this new master
-          const HubInventory = mongoose.model("HubInventory");
-          await HubInventory.findOneAndUpdate(
-            { hubId: process.env.DEFAULT_HUB_ID || "MAIN_HUB", productId: mid },
-            { $setOnInsert: { availableQty: 0, reservedQty: 0 } },
-            { upsert: true }
-          );
-          
-          console.log(`[updateProduct] SUCCESS: Created new Master Product ${mid} from approved Seller item.`);
-        } catch (promErr) {
-          console.error("[updateProduct] Master promotion failed:", promErr.message);
-        }
-      }
-      
       // 3. SYNC: If we have a master ID, ensure status and customerPrice are synced ONLY to Master Catalog
       if (mid) {
         const masterUpdate = {};
@@ -1570,6 +1771,367 @@ export const updateVariantStock = async (req, res) => {
       note: note || null,
     });
   } catch (error) {
+    return handleResponse(res, 500, error.message);
+  }
+};
+
+/* ===============================
+   SELLER PRODUCT → GO LIVE (ADMIN)
+ ================================ */
+export const getSellerProductGoLivePreview = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return handleResponse(res, 400, "Invalid product ID");
+    }
+
+    const sellerProduct = await Product.findById(id)
+      .populate("categoryId", "name")
+      .populate("subcategoryId", "name")
+      .populate("sellerId", "shopName name email phone")
+      .populate({
+        path: "masterProductId",
+        populate: [
+          { path: "categoryId", select: "name" },
+          { path: "subcategoryId", select: "name" },
+        ],
+      })
+      .lean();
+
+    if (!sellerProduct || sellerProduct.ownerType !== "seller") {
+      return handleResponse(res, 404, "Seller product not found");
+    }
+
+    const linkedMaster =
+      sellerProduct.masterProductId && typeof sellerProduct.masterProductId === "object"
+        ? sellerProduct.masterProductId
+        : null;
+
+    const sellerSignature = buildVariantSignature(
+      sellerProduct.variants,
+      sellerProduct.unit,
+    );
+
+    const exactNameMatches = await Product.find({
+      ownerType: "admin",
+      name: {
+        $regex: new RegExp(
+          `^${escapeRegex(String(sellerProduct.name || "").trim())}$`,
+          "i",
+        ),
+      },
+    })
+      .populate("categoryId", "name")
+      .populate("subcategoryId", "name")
+      .select(
+        "name slug status price salePrice stock variants mainImage galleryImages categoryId subcategoryId unit brand weight description",
+      )
+      .lean();
+
+    const excludeIds = new Set([
+      ...(linkedMaster ? [String(linkedMaster._id)] : []),
+    ]);
+
+    const exactMatches = exactNameMatches
+      .filter((m) => !excludeIds.has(String(m._id)))
+      .filter(
+        (m) => buildVariantSignature(m.variants, m.unit) === sellerSignature,
+      );
+
+    const sameNameDifferentVariants = exactNameMatches.filter(
+      (m) =>
+        !excludeIds.has(String(m._id)) &&
+        buildVariantSignature(m.variants, m.unit) !== sellerSignature,
+    );
+
+    let relatedMasters = [];
+    const catId = sellerProduct.categoryId?._id || sellerProduct.categoryId;
+    const firstToken = String(sellerProduct.name || "")
+      .split(/\s+/)
+      .filter(Boolean)[0];
+    if (catId && firstToken) {
+      relatedMasters = await Product.find({
+        ownerType: "admin",
+        categoryId: catId,
+        _id: {
+          $nin: [
+            ...(linkedMaster ? [linkedMaster._id] : []),
+            ...exactNameMatches.map((m) => m._id),
+          ],
+        },
+        name: { $regex: escapeRegex(firstToken), $options: "i" },
+      })
+        .limit(8)
+        .populate("categoryId", "name")
+        .select(
+          "name slug status price salePrice stock variants mainImage categoryId unit",
+        )
+        .lean();
+    }
+
+    const sellerVariants = mapVariantsForResponse(sellerProduct.variants);
+    const supplyPrice = Number(
+      sellerProduct.purchasePrice ?? sellerProduct.price ?? 0,
+    );
+
+    return handleResponse(res, 200, "Go-live preview loaded", {
+      sellerProduct: {
+        ...sellerProduct,
+        variants: sellerVariants,
+        supplyPrice,
+        sellerStock: catalogStockFromProduct(sellerProduct),
+      },
+      linkedMaster: linkedMaster
+        ? {
+            ...linkedMaster,
+            variants: mapVariantsForResponse(linkedMaster.variants),
+          }
+        : null,
+      exactMatches: exactMatches.map((m) => ({
+        ...m,
+        variants: mapVariantsForResponse(m.variants),
+      })),
+      sameNameDifferentVariants: sameNameDifferentVariants.map((m) => ({
+        ...m,
+        variants: mapVariantsForResponse(m.variants),
+      })),
+      variantSignature: sellerSignature,
+      relatedMasters: relatedMasters.map((m) => ({
+        ...m,
+        variants: mapVariantsForResponse(m.variants),
+      })),
+      hasExistingMaster: Boolean(linkedMaster || exactMatches.length > 0),
+      canCreateNewMaster: !linkedMaster && exactMatches.length === 0,
+      isAlreadyLive:
+        sellerProduct.status === "active" && Boolean(linkedMaster),
+    });
+  } catch (error) {
+    return handleResponse(res, 500, error.message);
+  }
+};
+
+export const publishSellerProductGoLive = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { action, masterProductId, variantSellPrices, defaultSellPrice, forceCreate } =
+      req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return handleResponse(res, 400, "Invalid product ID");
+    }
+
+    const sellerProduct = await Product.findById(id);
+    if (!sellerProduct || sellerProduct.ownerType !== "seller") {
+      return handleResponse(res, 404, "Seller product not found");
+    }
+
+    const priceRows = parseVariantsField(variantSellPrices);
+    const defaultSell = Number(defaultSellPrice || req.body.customerPrice) || 0;
+
+    const buildMasterVariantsFromSeller = (priceInputs) => {
+      const source =
+        Array.isArray(sellerProduct.variants) && sellerProduct.variants.length > 0
+          ? sellerProduct.variants.map((v) =>
+              typeof v?.toObject === "function" ? v.toObject() : { ...v },
+            )
+          : [
+              {
+                name: "Default",
+                unit: sellerProduct.unit,
+                stock: Number(sellerProduct.stock) || 0,
+              },
+            ];
+
+      return normalizeVariants(
+        source.map((sv, i) => {
+          const row =
+            priceInputs.find(
+              (p) =>
+                String(p?.name || "")
+                  .trim()
+                  .toLowerCase() === String(sv?.name || "").trim().toLowerCase(),
+            ) ||
+            priceInputs[i] ||
+            {};
+          const salePrice =
+            Number(row.salePrice ?? row.price) ||
+            defaultSell ||
+            Number(sv.salePrice ?? sv.price) ||
+            0;
+          return {
+            name: sv.name,
+            unit: sv.unit || sellerProduct.unit,
+            price: salePrice,
+            salePrice,
+            stock: 0,
+          };
+        }),
+        {
+          defaultUnit: sellerProduct.unit,
+          basePrice: defaultSell,
+          baseSalePrice: defaultSell,
+        },
+      );
+    };
+
+    const applyCustomerPricesToMaster = (master, priceInputs) => {
+      const update = { status: "active" };
+      if (master.variants?.length > 0) {
+        update.variants = master.variants.map((mv, i) => {
+          const obj = typeof mv?.toObject === "function" ? mv.toObject() : { ...mv };
+          const row =
+            priceInputs.find(
+              (p) =>
+                String(p?.name || "")
+                  .trim()
+                  .toLowerCase() === String(obj.name || "").trim().toLowerCase(),
+            ) ||
+            priceInputs[i] ||
+            {};
+          const sp =
+            Number(row?.salePrice ?? row?.price) ||
+            defaultSell ||
+            Number(obj.salePrice ?? obj.price) ||
+            0;
+          return { ...obj, price: sp, salePrice: sp };
+        });
+        update.price = Number(update.variants[0]?.salePrice) || defaultSell;
+        update.salePrice = update.price;
+        update.stock = totalVariantStock(update.variants);
+      } else if (defaultSell > 0) {
+        update.price = defaultSell;
+        update.salePrice = defaultSell;
+      }
+      return update;
+    };
+
+    if (action === "link_existing" || action === "activate_linked") {
+      const targetId = masterProductId || sellerProduct.masterProductId;
+      if (!targetId || !mongoose.Types.ObjectId.isValid(String(targetId))) {
+        return handleResponse(res, 400, "Select an existing master catalog product");
+      }
+
+      const master = await Product.findById(targetId);
+      if (!master || master.ownerType !== "admin") {
+        return handleResponse(res, 404, "Master catalog product not found");
+      }
+
+      const masterUpdate = applyCustomerPricesToMaster(master, priceRows);
+      await Product.findByIdAndUpdate(master._id, { $set: masterUpdate });
+
+      await Product.findByIdAndUpdate(sellerProduct._id, {
+        $set: { masterProductId: master._id, status: "active" },
+      });
+
+      const sellPrice =
+        Number(masterUpdate.salePrice || master.salePrice || master.price) ||
+        defaultSell;
+      const hubQty =
+        totalVariantStock(masterUpdate.variants) ||
+        catalogStockFromProduct(master) ||
+        0;
+
+      await syncAdminHubStock(master._id, hubQty, {
+        sellPrice,
+        reorderLevel: Number(master.lowStockAlert || 10),
+      });
+
+      return handleResponse(res, 200, "Linked to catalog and live for customers", {
+        masterProductId: master._id,
+        sellerProductId: sellerProduct._id,
+      });
+    }
+
+    if (action === "create_master") {
+      if (sellerProduct.masterProductId) {
+        return handleResponse(
+          res,
+          400,
+          "This seller product is already linked to a master catalog item",
+        );
+      }
+
+      const duplicate = await findMasterByNameAndVariants({
+        name: sellerProduct.name,
+        variants: sellerProduct.variants,
+        unit: sellerProduct.unit,
+        categoryId: sellerProduct.categoryId,
+        subcategoryId: sellerProduct.subcategoryId,
+      });
+
+      if (duplicate && !forceCreate) {
+        return handleResponse(
+          res,
+          409,
+          `Master catalog already has "${duplicate.name}" with the same variant options. Link to it instead of creating a duplicate.`,
+          {
+            existingMaster: formatMasterMatchResponse(duplicate),
+          },
+        );
+      }
+
+      const masterVariants = buildMasterVariantsFromSeller(priceRows);
+      const firstSell =
+        Number(masterVariants[0]?.salePrice) ||
+        defaultSell ||
+        Number(sellerProduct.salePrice ?? sellerProduct.price) ||
+        0;
+
+      if (firstSell <= 0) {
+        return handleResponse(
+          res,
+          400,
+          "Set a customer selling price for at least one variant",
+        );
+      }
+
+      const masterSlug = await ensureUniqueSlug(`${sellerProduct.name}-master`);
+      const newMaster = await Product.create({
+        name: sellerProduct.name,
+        slug: masterSlug,
+        ownerType: "admin",
+        status: "active",
+        categoryId: sellerProduct.categoryId,
+        subcategoryId: sellerProduct.subcategoryId,
+        unit: normalizeUnit(sellerProduct.unit),
+        mainImage: sellerProduct.mainImage,
+        galleryImages: sellerProduct.galleryImages || [],
+        description: sellerProduct.description,
+        brand: sellerProduct.brand,
+        weight: sellerProduct.weight,
+        tags: sellerProduct.tags,
+        price: firstSell,
+        salePrice: firstSell,
+        purchasePrice:
+          Number(sellerProduct.purchasePrice ?? sellerProduct.price) || 0,
+        stock: 0,
+        variants: masterVariants,
+        lowStockAlert: sellerProduct.lowStockAlert || 10,
+      });
+
+      await Product.findByIdAndUpdate(sellerProduct._id, {
+        $set: { masterProductId: newMaster._id, status: "active" },
+      });
+
+      await syncAdminHubStock(newMaster._id, 0, {
+        sellPrice: firstSell,
+        reorderLevel: Number(sellerProduct.lowStockAlert || 10),
+      });
+
+      return handleResponse(res, 200, "Master catalog copy created — product is live", {
+        masterProductId: newMaster._id,
+        sellerProductId: sellerProduct._id,
+      });
+    }
+
+    return handleResponse(
+      res,
+      400,
+      "Invalid action. Use create_master, link_existing, or activate_linked",
+    );
+  } catch (error) {
+    const dupMsg = duplicateKeyMessage(error);
+    if (dupMsg) return handleResponse(res, 400, dupMsg);
     return handleResponse(res, 500, error.message);
   }
 };

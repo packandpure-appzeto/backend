@@ -17,6 +17,30 @@ const DEFAULT_HUB_ID = process.env.DEFAULT_HUB_ID || "MAIN_HUB";
 
 const PR_DONE_STATUSES = new Set(["verified", "closed", "cancelled"]);
 
+const PR_IN_DELIVERY_STATUSES = new Set([
+  "pickup_assigned",
+  "picked",
+  "hub_delivered",
+]);
+
+const PR_AWAITING_VENDOR_STATUSES = new Set(["created", "vendor_confirmed"]);
+
+const prStatusLabel = (status) => {
+  const map = {
+    created: "Pending vendor",
+    vendor_confirmed: "Vendor confirmed",
+    pickup_assigned: "Pickup assigned",
+    picked: "In transit to hub",
+    hub_delivered: "At hub gate",
+    received_at_hub: "Received at hub",
+    verified: "Verified & stocked",
+    closed: "Closed",
+    cancelled: "Cancelled",
+    exception: "Exception",
+  };
+  return map[String(status || "")] || String(status || "—");
+};
+
 const PICKUP_OTP_EXPIRY_MINUTES = Math.max(
   1,
   Number(process.env.PICKUP_OTP_EXPIRY_MINUTES || 30),
@@ -149,8 +173,24 @@ const assignPickupToRequest = async (doc, partner) => {
   return otp;
 };
 
+const mapPrPhase = (status) => {
+  if (PR_IN_DELIVERY_STATUSES.has(status)) return "in_delivery";
+  if (PR_AWAITING_VENDOR_STATUSES.has(status)) return "awaiting_vendor";
+  if (status === "received_at_hub") return "at_hub";
+  if (status === "exception") return "exception";
+  if (PR_DONE_STATUSES.has(status)) return "completed";
+  return "other";
+};
+
 const mapRow = (reqDoc) => {
-  const item = Array.isArray(reqDoc.items) ? reqDoc.items[0] : null;
+  const items = Array.isArray(reqDoc.items) ? reqDoc.items : [];
+  const item = items[0] || null;
+  const quantity = Number(item?.shortageQty || item?.requiredQty || reqDoc.quantity || 0);
+  const unitCost = Number(item?.vendorUnitCost || 0);
+  const gstAmount = Number(item?.gstAmount || 0);
+  const lineTotal = toMoney(unitCost * quantity + gstAmount);
+  const status = String(reqDoc.status || "");
+
   return {
     _id: reqDoc._id,
     requestId: reqDoc.requestId,
@@ -165,21 +205,36 @@ const mapRow = (reqDoc) => {
     product:
       item?.productId?.name ||
       reqDoc.product ||
-      (Array.isArray(reqDoc.items) && reqDoc.items.length > 1
-        ? `${reqDoc.items.length} items`
-        : "Product"),
-    quantity: Number(item?.shortageQty || item?.requiredQty || reqDoc.quantity || 0),
-    unitCost: Number(item?.vendorUnitCost || 0),
+      (items.length > 1 ? `${items.length} items` : "Product"),
+    quantity,
+    unitCost,
+    totalCost: lineTotal,
     gstRate: Number(item?.gstRate || 0),
-    gstAmount: Number(item?.gstAmount || 0),
-    status: reqDoc.status,
-    pickupPartnerId: reqDoc.pickupPartnerId || null,
-    pickupPartnerName: reqDoc.pickupPartnerName || "",
+    gstAmount,
+    status,
+    statusLabel: prStatusLabel(status),
+    phase: mapPrPhase(status),
+    isOpen: !PR_DONE_STATUSES.has(status),
+    vendorResponse: reqDoc.vendorResponse?.status || "pending",
+    pickupPartnerId: reqDoc.pickupPartnerId?._id || reqDoc.pickupPartnerId || null,
+    pickupPartnerName:
+      reqDoc.pickupPartnerId?.name || reqDoc.pickupPartnerName || "",
+    pickupPartnerPhone: reqDoc.pickupPartnerId?.phone || "",
     notes: reqDoc.notes || "",
     exceptionReason: reqDoc.exceptionReason || "",
     eta: reqDoc.eta || null,
     createdAt: reqDoc.createdAt,
     updatedAt: reqDoc.updatedAt,
+    items: items.map((row) => ({
+      productId: row.productId?._id || row.productId || null,
+      productName: row.productId?.name || "Product",
+      quantity: Number(row.shortageQty || row.requiredQty || 0),
+      unitCost: Number(row.vendorUnitCost || 0),
+      totalCost: toMoney(
+        Number(row.vendorUnitCost || 0) * Number(row.shortageQty || row.requiredQty || 0) +
+          Number(row.gstAmount || 0),
+      ),
+    })),
   };
 };
 
@@ -228,9 +283,181 @@ const mapSellerRow = (reqDoc) => ({
   updatedAt: reqDoc.updatedAt,
 });
 
+export const getPurchaseRequestProductContext = async (req, res) => {
+  try {
+    const { productId } = req.query;
+    if (!productId || !mongoose.Types.ObjectId.isValid(productId)) {
+      return handleResponse(res, 400, "Valid productId is required");
+    }
+
+    const product = await Product.findById(productId)
+      .populate("sellerId", "shopName name phone email isVerified status")
+      .populate("categoryId", "name")
+      .populate("subcategoryId", "name")
+      .populate({
+        path: "masterProductId",
+        select: "name slug status price salePrice stock mainImage unit",
+      })
+      .lean();
+
+    if (!product || product.ownerType !== "seller") {
+      return handleResponse(res, 404, "Seller listing not found");
+    }
+
+    const vendorId = product.sellerId?._id || product.sellerId;
+    if (!vendorId) {
+      return handleResponse(res, 400, "This product has no linked vendor");
+    }
+
+    const sellerStock = (() => {
+      const variants = Array.isArray(product.variants) ? product.variants : [];
+      if (variants.length) {
+        return variants.reduce((sum, v) => sum + (Number(v?.stock) || 0), 0);
+      }
+      return Math.max(0, Number(product.stock) || 0);
+    })();
+
+    const isCatalogListing = Boolean(product.masterProductId);
+    const listingType = isCatalogListing ? "catalog" : "seller_own";
+    const supplyPrice = Number(
+      product.purchasePrice ?? product.price ?? product.salePrice ?? 0,
+    );
+
+    const [openRequests, recentCompleted] = await Promise.all([
+      PurchaseRequest.find({
+        vendorId,
+        status: { $nin: Array.from(PR_DONE_STATUSES) },
+        "items.productId": product._id,
+      })
+        .populate("vendorId", "shopName name")
+        .populate("items.productId", "name mainImage unit")
+        .populate("pickupPartnerId", "name phone")
+        .sort({ createdAt: -1 })
+        .limit(20)
+        .lean(),
+      PurchaseRequest.find({
+        vendorId,
+        status: { $in: ["verified", "closed"] },
+        "items.productId": product._id,
+      })
+        .populate("items.productId", "name")
+        .sort({ updatedAt: -1 })
+        .limit(5)
+        .lean(),
+    ]);
+
+    const mapContextRow = (row) => {
+      const line = (row.items || []).find(
+        (it) => String(it.productId?._id || it.productId) === String(product._id),
+      ) || row.items?.[0];
+      const phase = PR_IN_DELIVERY_STATUSES.has(row.status)
+        ? "in_delivery"
+        : PR_AWAITING_VENDOR_STATUSES.has(row.status)
+          ? "awaiting_vendor"
+          : row.status === "received_at_hub"
+            ? "at_hub"
+            : row.status === "exception"
+              ? "exception"
+              : "other";
+
+      const quantity = Number(line?.shortageQty || line?.requiredQty || 0);
+      const unitCost = Number(line?.vendorUnitCost || 0);
+      return {
+        _id: row._id,
+        requestId: row.requestId,
+        productName: line?.productId?.name || product.name,
+        status: row.status,
+        statusLabel: prStatusLabel(row.status),
+        phase,
+        quantity,
+        unitCost,
+        totalCost: toMoney(unitCost * quantity + Number(line?.gstAmount || 0)),
+        vendorResponse: row.vendorResponse?.status || "pending",
+        pickupPartner: row.pickupPartnerId
+          ? {
+              name: row.pickupPartnerId?.name || row.pickupPartnerName || "Pickup",
+              phone: row.pickupPartnerId?.phone || "",
+            }
+          : null,
+        notes: row.notes || "",
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+        isOpen: !PR_DONE_STATUSES.has(row.status),
+      };
+    };
+
+    const open = openRequests.map(mapContextRow);
+    const hasBlockingRequest = open.length > 0;
+    const inDelivery = open.filter((r) => r.phase === "in_delivery");
+    const awaitingVendor = open.filter((r) => r.phase === "awaiting_vendor");
+
+    return handleResponse(res, 200, "Purchase request context loaded", {
+      product: {
+        _id: product._id,
+        name: product.name,
+        mainImage: product.mainImage,
+        status: product.status,
+        unit: product.unit,
+        brand: product.brand,
+        category: product.categoryId?.name || null,
+        subcategory: product.subcategoryId?.name || null,
+        sellerStock,
+        supplyPrice,
+        variants: (product.variants || []).map((v) => ({
+          name: v.name,
+          stock: Number(v.stock) || 0,
+          price: Number(v.price ?? v.salePrice) || supplyPrice,
+        })),
+      },
+      vendor: {
+        _id: vendorId,
+        shopName: product.sellerId?.shopName || product.sellerId?.name || "Vendor",
+        name: product.sellerId?.name || "",
+        phone: product.sellerId?.phone || "",
+        isVerified: product.sellerId?.isVerified,
+      },
+      listingType,
+      listingTypeLabel: isCatalogListing
+        ? "Hub catalog listing"
+        : "Seller-owned product",
+      masterProduct: isCatalogListing
+        ? {
+            _id: product.masterProductId?._id || product.masterProductId,
+            name: product.masterProductId?.name || "Master product",
+            customerPrice:
+              product.masterProductId?.salePrice ||
+              product.masterProductId?.price ||
+              null,
+          }
+        : null,
+      openRequests: open,
+      inDelivery,
+      awaitingVendor,
+      recentCompleted: recentCompleted.map(mapContextRow),
+      hasBlockingRequest,
+      canCreateRequest: sellerStock > 0 && !hasBlockingRequest,
+      blockReason: hasBlockingRequest
+        ? "An open purchase request already exists for this seller listing."
+        : sellerStock <= 0
+          ? "Seller has no stock available to procure."
+          : null,
+    });
+  } catch (error) {
+    return handleResponse(res, 500, error.message);
+  }
+};
+
 export const getPurchaseRequests = async (req, res) => {
   try {
-    const { status, orderId, requestId, hubId = DEFAULT_HUB_ID } = req.query;
+    const {
+      status,
+      orderId,
+      requestId,
+      hubId = DEFAULT_HUB_ID,
+      vendorId,
+      productId,
+      openOnly,
+    } = req.query;
     const { page, limit, skip } = getPagination(req, {
       defaultLimit: 25,
       maxLimit: 100,
@@ -241,11 +468,21 @@ export const getPurchaseRequests = async (req, res) => {
     if (status && status !== "all") query.status = status;
     if (orderId && mongoose.Types.ObjectId.isValid(orderId)) query.orderId = orderId;
     if (requestId) query.requestId = { $regex: String(requestId), $options: "i" };
+    if (vendorId && mongoose.Types.ObjectId.isValid(vendorId)) {
+      query.vendorId = vendorId;
+    }
+    if (productId && mongoose.Types.ObjectId.isValid(productId)) {
+      query["items.productId"] = productId;
+    }
+    if (String(openOnly || "").toLowerCase() === "true") {
+      query.status = { $nin: Array.from(PR_DONE_STATUSES) };
+    }
 
     const [items, total] = await Promise.all([
       PurchaseRequest.find(query)
         .populate("vendorId", "shopName name")
-        .populate("items.productId", "name")
+        .populate("items.productId", "name mainImage unit")
+        .populate("pickupPartnerId", "name phone")
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
@@ -253,12 +490,16 @@ export const getPurchaseRequests = async (req, res) => {
       PurchaseRequest.countDocuments(query),
     ]);
 
+    const mapped = items.map(mapRow);
+    const openCount = mapped.filter((row) => row.isOpen).length;
+
     return handleResponse(res, 200, "Purchase requests fetched", {
-      items: items.map(mapRow),
+      items: mapped,
       page,
       limit,
       total,
       totalPages: Math.ceil(total / limit) || 1,
+      openCount,
     });
   } catch (error) {
     return handleResponse(res, 500, error.message);
@@ -289,15 +530,43 @@ export const createManualPurchaseRequest = async (req, res) => {
 
     const [vendor, product] = await Promise.all([
       Seller.findById(vendorId).select("_id shopName name"),
-      Product.findById(productId).select("_id name status stock price salePrice purchasePrice gstRate"),
+      Product.findById(productId).select(
+        "_id name status stock price salePrice purchasePrice gstRate variants",
+      ),
     ]);
 
     if (!vendor) return handleResponse(res, 404, "Vendor not found");
     if (!product) return handleResponse(res, 404, "Product not found");
 
-    // Validation: Check if seller product has stock
-    if (Number(product.stock || 0) <= 0) {
-      return handleResponse(res, 400, `Cannot create PR: ${product.name} is out of stock (Stock: 0)`);
+    const sellerStock = (() => {
+      const variants = Array.isArray(product.variants) ? product.variants : [];
+      if (variants.length) {
+        return variants.reduce((sum, v) => sum + (Number(v?.stock) || 0), 0);
+      }
+      return Math.max(0, Number(product.stock) || 0);
+    })();
+
+    if (sellerStock <= 0) {
+      return handleResponse(
+        res,
+        400,
+        `Cannot create PR: ${product.name} is out of stock at the vendor.`,
+      );
+    }
+
+    const openDuplicate = await PurchaseRequest.findOne({
+      vendorId: vendor._id,
+      status: { $nin: Array.from(PR_DONE_STATUSES) },
+      "items.productId": product._id,
+    }).select("requestId status");
+
+    if (openDuplicate) {
+      return handleResponse(
+        res,
+        409,
+        `Open purchase request ${openDuplicate.requestId} already exists for this product.`,
+        { requestId: openDuplicate.requestId, status: openDuplicate.status },
+      );
     }
 
     let requestId = generateRequestId();

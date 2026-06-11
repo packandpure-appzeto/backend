@@ -2,6 +2,7 @@ import express from "express";
 import { verifyToken, allowRoles } from "../middleware/authMiddleware.js";
 import {
   getPurchaseRequests,
+  getPurchaseRequestProductContext,
   createManualPurchaseRequest,
   updatePurchaseRequestStatus,
   assignPickupPartner,
@@ -13,6 +14,12 @@ import {
 const router = express.Router();
 
 router.get("/", verifyToken, allowRoles("admin"), getPurchaseRequests);
+router.get(
+  "/product-context",
+  verifyToken,
+  allowRoles("admin"),
+  getPurchaseRequestProductContext,
+);
 router.post("/", verifyToken, allowRoles("admin"), createManualPurchaseRequest);
 router.put("/:id/status", verifyToken, allowRoles("admin"), updatePurchaseRequestStatus);
 router.put(
