@@ -18,6 +18,27 @@ const generateToken = (customer) =>
         { expiresIn: "7d" }
     );
 
+const isProfileComplete = (customer) => {
+    if (!customer) return false;
+    const hasPersonal =
+        customer.name &&
+        customer.email &&
+        customer.addresses &&
+        customer.addresses.length > 0 &&
+        customer.addresses[0].fullAddress &&
+        customer.addresses[0].landmark;
+
+    const hasBusiness =
+        customer.businessName &&
+        customer.businessAddress &&
+        customer.businessType &&
+        customer.panNo &&
+        customer.gstNo &&
+        customer.fssaiNumber;
+
+    return !!(hasPersonal && hasBusiness);
+};
+
 const logOtpDev = (label, otp) => {
     if (useRealSMS()) {
         console.log(`${label} OTP (real SMS mode):`, otp);
@@ -125,7 +146,7 @@ export const verifyCustomerOTP = async (req, res) => {
         return handleResponse(res, 200, "Login successful", {
             token,
             customer: publicCustomer,
-            isNewUser: !publicCustomer.name,
+            isNewUser: !isProfileComplete(customer),
         });
     } catch (error) {
         return handleResponse(res, 500, error.message);
@@ -160,7 +181,7 @@ export const getCustomerProfile = async (req, res) => {
 ================================ */
 export const updateCustomerProfile = async (req, res) => {
     try {
-        const { name, email, addresses, businessName, businessAddress, contactPerson, panNo, gstNo, fssaiNumber, avatar } =
+        const { name, email, addresses, businessName, businessAddress, businessType, contactPerson, panNo, gstNo, fssaiNumber, avatar } =
             req.body;
 
         const customer = await Customer.findById(req.user.id);
@@ -172,6 +193,7 @@ export const updateCustomerProfile = async (req, res) => {
         if (email !== undefined) customer.email = email ? String(email).trim().toLowerCase() : undefined;
         if (businessName !== undefined) customer.businessName = businessName;
         if (businessAddress !== undefined) customer.businessAddress = businessAddress;
+        if (businessType !== undefined) customer.businessType = businessType;
         if (contactPerson !== undefined) customer.contactPerson = contactPerson;
         if (panNo !== undefined) customer.panNo = panNo;
         if (gstNo !== undefined) customer.gstNo = gstNo;

@@ -23,6 +23,7 @@ import pickupPartnerRoute from "./pickupPartnerRoutes.js";
 import pickupRoute from "./pickupRoutes.js";
 import reportRoute from "./reportRoutes.js";
 import uploadRoute from "./uploadRoutes.js";
+import productRequestRoute from "./productRequestRoutes.js";
 
 import express from "express";
 
@@ -58,6 +59,7 @@ const setupRoutes = (app) => {
     router.use("/reviews", reviewRoute);
     router.use("/admin/faqs", faqRoute);
     router.use("/public/faqs", faqRoute); // For public access without admin prefix
+    router.use("/product-requests", productRequestRoute);
 
     app.use("/api", router);
 }

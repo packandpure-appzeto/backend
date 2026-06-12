@@ -34,6 +34,10 @@ const userSchema = new mongoose.Schema(
             type: String,
             trim: true,
         },
+        businessType: {
+            type: String,
+            trim: true,
+        },
         contactPerson: {
             type: String,
             trim: true,
